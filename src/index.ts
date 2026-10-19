@@ -253,7 +253,10 @@ export class Assistant extends Agent<Env> {
     const text = (res as unknown as { text?: string }).text ?? "";
     const submissionId = (res as unknown as { operationId?: string }).operationId;
     const status = (res as unknown as { status?: string }).status;
-    return { text, submissionId, operationId: submissionId, status };
+    // `reason` is pi's own words for why an `unanswered` run ended (failed,
+    // aborted, withdrawn). Always surface it — without it, failures are silent.
+    const reason = (res as unknown as { reason?: string }).reason ?? null;
+    return { text, submissionId, operationId: submissionId, status, reason };
   }
 
   async listModels() {

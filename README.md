@@ -262,15 +262,17 @@ Response:
   "text": "...",
   "submissionId": "...",
   "operationId": "...",
-  "status": "done"
+  "status": "done",
+  "reason": null
 }
 ```
 
 | Field | Meaning |
 |---|---|
-| `text` | Final model text |
+| `text` | Final model text (`""` when `unanswered`) |
 | `submissionId` / `operationId` | Same value — the durable run id (idempotency key) |
-| `status` | e.g. `done` |
+| `status` | `done` (answered) or `unanswered` (failed, aborted, withdrawn) |
+| `reason` | pi's own words for why an `unanswered` run ended; `null` on `done` — read this first when debugging |
 
 Errors:
 
