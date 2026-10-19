@@ -427,15 +427,33 @@ Tips:
 
 ---
 
-## Bucket / fleet deploy (documented only)
+## Bucket / fleet deploy (tested single-node, systemd files included)
 
-Local `celld dev` needs no bucket. For a real fleet node you need an S3-compatible bucket (e.g. Cloudflare R2) and the files in [deploy/](deploy/):
+Local `celld dev` needs no bucket. For a real fleet node you need an S3-compatible bucket (e.g. Cloudflare R2) and the files in [deploy/](deploy/). Verified: deploy → single bucket-backed node → `/health`, `/models`, and a `done` tool-loop prompt.
+
+**Vars and secrets:** `celld deploy` ignores `.dev.vars`/`.env` — Worker variables ship via wrangler `[vars]`, baked into the deployment. There is no secrets mechanism, so `ROUTER_API_KEY`-style secrets also travel in `[vars]` (plaintext in your own bucket). Keep them out of git: add `[vars]` as a temporary local edit and restore after deploying.
 
 ```sh
-export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=auto
-export S3_ENDPOINT=https://ACCOUNT_ID.r2.cloudflarestorage.com
-export CELLD_BUCKET=s3://YOUR-BUCKET
+set -a; source .dev.vars; set +a   # S3 creds for the CLI (deploy ignores the file itself)
+cp wrangler.jsonc /tmp/wrangler.jsonc.bak
+# add a temporary local-only "vars": { ROUTER_BASE_URL, ROUTER_MODEL, ROUTER_API_KEY }
+celld deploy . --bucket "$CELLD_BUCKET" --endpoint "$S3_ENDPOINT" --region "$AWS_REGION" --dry-run
 celld deploy . --bucket "$CELLD_BUCKET" --endpoint "$S3_ENDPOINT" --region "$AWS_REGION"
+cp /tmp/wrangler.jsonc.bak wrangler.jsonc   # restore; git status must show wrangler.jsonc clean
+```
+
+Shell one-off node (skip the gate for single-node tests; `deploy/` tuning is for systemd):
+
+```sh
+CELLD_READY_FLEET_GATE_MS=0 celld \
+  --bucket "$CELLD_BUCKET" --endpoint "$S3_ENDPOINT" --region "$AWS_REGION" \
+  --listen 127.0.0.1:8080 --internal-listen 127.0.0.1:8081 --advertise 127.0.0.1:8081
+# Worker listener: http://127.0.0.1:8080 — same API as celld dev, fresh
+# state (bucket nodes don't share .celld/dev/). Single node + default
+# durability means every write waits for a bucket round-trip: slower than
+# local, worse the farther the bucket. A second node settles writes
+# disk-to-disk instead.
+```
 ```
 
 - [deploy/celld.env](deploy/celld.env) — agreed non-default tuning (longer leases, slower rebalance/poll/waker ticks, 7-day LTX retention, idle eviction, RSS + residency caps). Each line documents its default and tradeoff. Not used by `celld dev`.
