@@ -13,7 +13,7 @@ ExecStart=/usr/local/bin/celld --bucket ${CELLD_BUCKET} --endpoint ${S3_ENDPOINT
 Restart=always
 # A fenced node waits out one lease lifetime (CELLD_TTL_MS=360000 => 360 s)
 # before restarting, so its old lease expires and a peer can take over cleanly.
-RestartSec=70
+RestartSec=370
 # Grace must exceed CELLD_SHUTDOWN_TOTAL_MS (default 40000) or SIGKILL can cut the handoff.
 TimeoutStopSec=90
 
