@@ -189,7 +189,8 @@ Three ways to choose a model beyond the default (env var **or** fetch-and-choose
 
 - **Env var:** `ROUTER_MODEL` / `ROUTER_EXTRA_MODELS` / `OPENCODE_MODEL` in `.dev.vars` (`celld dev` rebuilds on config change).
 - **Fetch:** `GET /models` returns the static catalog, per-provider `configured` flags, the resolved `default`, and live ids fetched from your router's `/models` endpoint (`router.live`, `null` when unreachable).
-- **Per-request override:** `POST /agent/:name/prompt` accepts `model` as `"provider/id"` or `{"provider","id"}`. The agent is session-pinned to it until changed. Unknown ids return HTTP 400 with a pointer to `GET /models`. Router ids must be pre-registered via `ROUTER_MODEL`/`ROUTER_EXTRA_MODELS` (pi resolves the session model against the static catalog).
+- **Per-request override:** `POST /agent/:name/prompt` accepts `model` as `"provider/id"` or `{"provider","id"}`. The agent is session-pinned to it until changed (the pin survives eviction/restarts). Unknown ids return HTTP 400 with a pointer to `GET /models`. Router ids must be pre-registered via `ROUTER_MODEL`/`ROUTER_EXTRA_MODELS` (pi resolves the session model against the static catalog).
+- **Stale-pin healing:** sessions durably remember their model, so an agent created under an old default would keep using a dead provider. On each prompt without an explicit `model`, the Worker compares against the current env default and re-pins only when it moved — intentional pins are never clobbered.
 
 ```sh
 curl localhost:9876/models | python3 -m json.tool | head -n 40
@@ -301,6 +302,15 @@ curl 'localhost:9876/agent/test/messages?limit=10'
 ```
 
 `limit` defaults to 20, capped at 100. Each entry is `{id, kind, preview}` (preview truncated at 800 chars).
+
+### `POST /agent/:name/reset`
+
+Start a fresh context for the agent (clears the transcript — useful after a run of failed prompts, or after switching providers). The next prompt re-applies the pin/heal logic, so it also picks up a moved default model.
+
+```sh
+curl -X POST localhost:9876/agent/test/reset
+# -> {"name":"test","reset":true}
+```
 
 ---
 

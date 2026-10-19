@@ -36,6 +36,8 @@ const ROUTER_PROVIDER = "router";
 const DEFAULT_ROUTER_BASE_URL = "http://localhost:11434/v1";
 const DEFAULT_ROUTER_MODEL = "llama-3.1-8b";
 const FALLBACK_OPENCODE_MODEL = "claude-haiku-5-5";
+// DO-storage key for the model this fleet last pinned a session to.
+const MODEL_FINGERPRINT_KEY = "fleet:modelFingerprint:v1";
 
 const MISSING_KEY_MESSAGE =
   "fleet: no model provider configured. Set at least one of ROUTER_MODEL " +
@@ -211,7 +213,6 @@ const echoTool = defineTool({
 export class Assistant extends Agent<Env> {
   registry = createRegistry();
   private modelsRef?: MutableModels;
-
   harness = new PiHarness({
     harness: async ({ storage, context }) => {
       const env = this.env as Env;
@@ -253,6 +254,8 @@ export class Assistant extends Agent<Env> {
     requestIdOrOptions?: string | { requestId?: string; operationId?: string },
     model?: unknown,
   ) {
+    const env = this.env as Env;
+    const models = this.modelsRef ?? buildModels(env);
     const wanted = parseModelRef(model);
     if (wanted) {
       const known = this.modelsRef?.getModel(wanted.provider, wanted.id);
@@ -263,6 +266,17 @@ export class Assistant extends Agent<Env> {
       }
       // Session-pinned: this agent keeps using the chosen model until changed.
       await this.harness.session().setModel(wanted);
+      await this.markPinnedModel(wanted);
+    } else {
+      // Heal stale pins: sessions durably remember their model, so an agent
+      // created under an old default (or old env) would otherwise keep using
+      // a provider that is no longer configured. Migrate to the current
+      // default only when it moved; explicit pins are left alone.
+      const def = resolveDefaultModel(env, models);
+      if (!(await this.pinnedModelMatches(def))) {
+        await this.harness.session().setModel(def);
+        await this.markPinnedModel(def);
+      }
     }
     const operationId =
       typeof requestIdOrOptions === "string"
@@ -298,6 +312,38 @@ export class Assistant extends Agent<Env> {
         : 20;
     const entries = await this.harness.session().messages();
     return entries.slice(-count).map((entry) => summarizeEntry(entry));
+  }
+
+  // Fresh context for this agent (clears the transcript). The next prompt
+  // re-applies the pin/heal logic in ask(), so a reset also picks up a moved
+  // default model.
+  async resetSession() {
+    await this.harness.session().reset();
+    return true;
+  }
+
+  // Which model WE last pinned this session to, in DO storage (survives
+  // eviction; pi's own tables are untouched). Absent for pre-upgrade
+  // sessions, which then count as moved and get migrated.
+  private modelFingerprint(model: { provider: string; id: string }): string {
+    return `${model.provider}/${model.id}`;
+  }
+
+  private async pinnedModelMatches(model: { provider: string; id: string }): Promise<boolean> {
+    try {
+      const stored = await this.ctx.storage.get<string>(MODEL_FINGERPRINT_KEY);
+      return stored === this.modelFingerprint(model);
+    } catch {
+      return false;
+    }
+  }
+
+  private async markPinnedModel(model: { provider: string; id: string }): Promise<void> {
+    try {
+      await this.ctx.storage.put(MODEL_FINGERPRINT_KEY, this.modelFingerprint(model));
+    } catch {
+      // Best effort: a missed mark just re-pins next prompt.
+    }
   }
 }
 
@@ -355,12 +401,14 @@ function getAssistantStub(env: Env, name: string) {
       ask: (...args: unknown[]) => Promise<unknown>;
       listModels: () => Promise<unknown>;
       recentMessages: (...args: unknown[]) => Promise<unknown>;
+      resetSession: () => Promise<unknown>;
     };
     idFromName?: (name: string) => unknown;
     get?: (id: unknown) => {
       ask: (...args: unknown[]) => Promise<unknown>;
       listModels: () => Promise<unknown>;
       recentMessages: (...args: unknown[]) => Promise<unknown>;
+      resetSession: () => Promise<unknown>;
     };
   };
   if (typeof binding.getByName === "function") return binding.getByName(name);
@@ -527,6 +575,14 @@ export default {
       const stub = getAssistantStub(env, name);
       const messages = await stub.recentMessages(parsed);
       return Response.json({ name, messages });
+    }
+
+    const resetMatch = url.pathname.match(/^\/agent\/([^/]+)\/reset$/);
+    if (resetMatch && request.method === "POST") {
+      const name = decodeURIComponent(resetMatch[1]);
+      const stub = getAssistantStub(env, name);
+      await stub.resetSession();
+      return Response.json({ name, reset: true });
     }
 
     return new Response("not found", { status: 404 });
