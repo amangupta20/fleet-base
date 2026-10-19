@@ -3,7 +3,17 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "celld base: Pi Durable fleet app, local-only under celld dev",
+  "description": "Minimal self-hosted Durable Objects fleet base — Cloudflare Worker + Durable Object agent (Pi models, SQLite resume), local-only under celld dev",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/amangupta20/fleet-base.git"
+  },
+  "homepage": "https://github.com/amangupta20/fleet-base#readme",
+  "bugs": {
+    "url": "https://github.com/amangupta20/fleet-base/issues"
+  },
+  "keywords": ["celld", "durable-objects", "cloudflare-workers", "agents", "pi", "fleet", "starter"],
   "engines": {
     "node": ">=22.19.0"
   },
