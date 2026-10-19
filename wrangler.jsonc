@@ -1,0 +1,11 @@
+{
+  // Minimal fleet Worker. No containers, no r2/kv/d1/queues/workflows yet.
+  "name": "fleet",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-19",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [{ "name": "ASSISTANT", "class_name": "Assistant" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Assistant"] }]
+}

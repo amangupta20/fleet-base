@@ -1,0 +1,20 @@
+{
+  "name": "fleet",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "celld base: Pi Durable fleet app, local-only under celld dev",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "dev": "celld dev",
+    "deploy": "celld deploy . --bucket $CELLD_BUCKET"
+  },
+  "dependencies": {
+    "@earendil-works/chord": "1.3.0",
+    "@earendil-works/pi-ai": "1.3.0",
+    "@earendil-works/pi-durable": "1.3.0",
+    "agents": "0.28.1"
+  }
+}
