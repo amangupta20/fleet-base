@@ -305,7 +305,7 @@ curl 'localhost:9876/agent/test/messages?limit=10'
 
 ### `POST /agent/:name/reset`
 
-Start a fresh context for the agent (clears the transcript — useful after a run of failed prompts, or after switching providers). The next prompt re-applies the pin/heal logic, so it also picks up a moved default model.
+Start a fresh context for the agent (pre-reset entries leave the active transcript — useful after a run of failed prompts, or after switching providers). The next prompt re-applies the pin/heal logic, so it also picks up a moved default model.
 
 ```sh
 curl -X POST localhost:9876/agent/test/reset
