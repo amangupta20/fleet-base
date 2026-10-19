@@ -2,5 +2,6 @@
 .dev.vars
 .env
 .env.local
+wrangler.deploy.jsonc
 node_modules/
 dist/

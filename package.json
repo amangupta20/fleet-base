@@ -19,7 +19,8 @@
   },
   "scripts": {
     "dev": "celld dev",
-    "deploy": "celld deploy . --bucket $CELLD_BUCKET"
+    "deploy": "node scripts/deploy.mjs",
+    "deploy:dry": "node scripts/deploy.mjs --dry-run"
   },
   "dependencies": {
     "@earendil-works/chord": "1.3.0",

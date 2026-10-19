@@ -431,16 +431,15 @@ Tips:
 
 Local `celld dev` needs no bucket. For a real fleet node you need an S3-compatible bucket (e.g. Cloudflare R2) and the files in [deploy/](deploy/). Verified: deploy → single bucket-backed node → `/health`, `/models`, and a `done` tool-loop prompt.
 
-**Vars and secrets:** `celld deploy` ignores `.dev.vars`/`.env` — Worker variables ship via wrangler `[vars]`, baked into the deployment. There is no secrets mechanism, so `ROUTER_API_KEY`-style secrets also travel in `[vars]` (plaintext in your own bucket). Keep them out of git: add `[vars]` as a temporary local edit and restore after deploying.
+**Vars and secrets without hoop-jumping:** `celld deploy` ignores `.dev.vars`/`.env` — Worker variables ship via wrangler `[vars]`, baked into the deployment, and celld has no secrets mechanism. So `npm run deploy` (→ [scripts/deploy.mjs](scripts/deploy.mjs)) does it for you: it reads provider vars from `.dev.vars` (allowlist: `ROUTER_*`, `OPENCODE_*`, `OPENAI_*`, `GEMINI_*` — bucket/CLI creds stay in your shell), merges them into a throwaway gitignored `wrangler.deploy.jsonc`, deploys, and deletes it. Extra args forward to `celld deploy`. Secrets land in the deployment objects inside your own bucket — never in git.
 
 ```sh
-set -a; source .dev.vars; set +a   # S3 creds for the CLI (deploy ignores the file itself)
-cp wrangler.jsonc /tmp/wrangler.jsonc.bak
-# add a temporary local-only "vars": { ROUTER_BASE_URL, ROUTER_MODEL, ROUTER_API_KEY }
-celld deploy . --bucket "$CELLD_BUCKET" --endpoint "$S3_ENDPOINT" --region "$AWS_REGION" --dry-run
-celld deploy . --bucket "$CELLD_BUCKET" --endpoint "$S3_ENDPOINT" --region "$AWS_REGION"
-cp /tmp/wrangler.jsonc.bak wrangler.jsonc   # restore; git status must show wrangler.jsonc clean
+set -a; source .dev.vars; set +a   # S3 creds + bucket flags for the CLI
+npm run deploy -- --dry-run        # bundle check only, writes nothing
+npm run deploy                     # deploy with vars from .dev.vars
 ```
+
+`node scripts/deploy.mjs --vars-file .env --dry-run` and `--print-config` (dumps the merged config **including secret values** — local debugging only) are available. Refuses to deploy when no provider vars are set.
 
 Shell one-off node (skip the gate for single-node tests; `deploy/` tuning is for systemd):
 
@@ -453,7 +452,6 @@ CELLD_READY_FLEET_GATE_MS=0 celld \
 # durability means every write waits for a bucket round-trip: slower than
 # local, worse the farther the bucket. A second node settles writes
 # disk-to-disk instead.
-```
 ```
 
 - [deploy/celld.env](deploy/celld.env) — agreed non-default tuning (longer leases, slower rebalance/poll/waker ticks, 7-day LTX retention, idle eviction, RSS + residency caps). Each line documents its default and tradeoff. Not used by `celld dev`.
