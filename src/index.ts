@@ -66,7 +66,11 @@ function authEnv(env: Env) {
   };
 }
 
-function routerModelEntry(id: string, baseUrl: string): Model<"openai-completions"> {
+function routerModelEntry(
+  id: string,
+  baseUrl: string,
+  live?: { contextWindow?: number; maxTokens?: number },
+): Model<"openai-completions"> {
   return {
     id,
     name: `${id} (router)`,
@@ -76,15 +80,29 @@ function routerModelEntry(id: string, baseUrl: string): Model<"openai-completion
     reasoning: false,
     input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 128000,
-    maxTokens: 16384,
+    // Live router limits win when known (e.g. 1M-context gateways);
+    // otherwise conservative generic defaults.
+    contextWindow: live?.contextWindow ?? 128000,
+    maxTokens: live?.maxTokens ?? 16384,
   };
+}
+
+// Live limits keyed by model id, from the router's OpenAI-compatible
+// /models endpoint. Empty when unreachable — callers keep static defaults.
+function liveLimitsMap(
+  info: readonly { id: string; contextWindow?: number; maxTokens?: number }[],
+): Map<string, { contextWindow?: number; maxTokens?: number }> {
+  return new Map(info.map((entry) => [entry.id, entry]));
 }
 
 // Every provider this fleet knows about. The custom router and OpenCode Go
 // are always registered (env-driven); OpenAI/Google stay registered so they
-// keep working when their keys are present. Nothing here does I/O.
-function buildModels(env: Env): MutableModels {
+// keep working when their keys are present. Nothing here does I/O, except an
+// optional live-limits overlay passed in by async callers.
+function buildModels(
+  env: Env,
+  live?: Map<string, { contextWindow?: number; maxTokens?: number }>,
+): MutableModels {
   const models = createModels({ authContext: authEnv(env) });
   const routerBase = nonEmpty(env?.ROUTER_BASE_URL) ?? DEFAULT_ROUTER_BASE_URL;
   const routerIds = [
@@ -107,7 +125,7 @@ function buildModels(env: Env): MutableModels {
             // Keyless local servers (e.g. Ollama) resolve as configured.
             apiKey: { name: "Router (keyless)", resolve: async () => ({ auth: {} }) },
           },
-      models: uniqueIds.map((id) => routerModelEntry(id, routerBase)),
+      models: uniqueIds.map((id) => routerModelEntry(id, routerBase, live?.get(id))),
       api: openAICompletionsApi(),
     }),
   );
@@ -202,7 +220,11 @@ export class Assistant extends Agent<Env> {
         name: "fleet-base",
         tools: [echoTool],
       });
-      const models = buildModels(env);
+      // Best-effort: adopt the router's real context/output limits so pi
+      // manages long transcripts against true capacity. Unreachable router
+      // (or no key yet) keeps the conservative static defaults.
+      const router = await fetchRouterLiveModels(env);
+      const models = buildModels(env, liveLimitsMap(router.info));
       this.modelsRef = models;
       return Harness.open(storage, { models, registry: this.registry }, context);
     },
@@ -348,8 +370,15 @@ function getAssistantStub(env: Env, name: string) {
   throw new Error("ASSISTANT binding has neither getByName nor idFromName/get");
 }
 
-async function fetchRouterLiveModels(env: Env): Promise<{ baseUrl: string; live: string[] | null }> {
+async function fetchRouterLiveModels(env: Env): Promise<{
+  baseUrl: string;
+  live: string[] | null;
+  info: { id: string; contextWindow?: number; maxTokens?: number }[];
+}> {
   const baseUrl = (nonEmpty(env?.ROUTER_BASE_URL) ?? DEFAULT_ROUTER_BASE_URL).replace(/\/+$/, "");
+  const empty = { baseUrl, live: null as string[] | null, info: [] as { id: string; contextWindow?: number; maxTokens?: number }[] };
+  const num = (value: unknown): number | undefined =>
+    typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
   try {
     const headers: Record<string, string> = { accept: "application/json" };
     const key = nonEmpty(env?.ROUTER_API_KEY);
@@ -358,26 +387,40 @@ async function fetchRouterLiveModels(env: Env): Promise<{ baseUrl: string; live:
       headers,
       signal: AbortSignal.timeout(5000),
     });
-    if (!res.ok) return { baseUrl, live: null };
+    if (!res.ok) return empty;
     const body = (await res.json()) as unknown;
     const list = Array.isArray(body)
       ? body
       : Array.isArray((body as { data?: unknown }).data)
         ? (body as { data: unknown[] }).data
         : [];
-    const ids = list
-      .map((entry) =>
+    const info = list.flatMap((entry) => {
+      const id =
         typeof entry === "string"
           ? entry
           : typeof (entry as { id?: unknown }).id === "string"
             ? ((entry as { id: string }).id as string)
-            : null,
-      )
-      .filter((id): id is string => Boolean(id))
-      .slice(0, 200);
-    return { baseUrl, live: ids };
+            : null;
+      if (!id) return [];
+      if (typeof entry === "string") return [{ id }];
+      const record = entry as Record<string, unknown>;
+      const caps = (record["capabilities"] ?? {}) as Record<string, unknown>;
+      return [
+        {
+          id,
+          contextWindow:
+            num(record["context_length"]) ?? num(record["contextWindow"]) ?? num(caps["contextWindow"]),
+          maxTokens:
+            num(record["max_completion_tokens"]) ??
+            num(record["maxOutput"]) ??
+            num(record["maxTokens"]) ??
+            num(caps["maxOutput"]),
+        },
+      ];
+    });
+    return { baseUrl, live: info.map((entry) => entry.id).slice(0, 200), info };
   } catch {
-    return { baseUrl, live: null };
+    return empty;
   }
 }
 
@@ -390,19 +433,26 @@ export default {
     }
 
     if (request.method === "GET" && url.pathname === "/models") {
-      // Static catalog (no DO activation) + live router ids + env status,
-      // so you can fetch, choose, and set sight unseen.
-      const models = buildModels(env);
+      // Static catalog (no DO activation) + live router ids/limits + env
+      // status, so you can fetch, choose, and set sight unseen. Router
+      // entries carry live context/output limits when the router answers.
+      const router = await fetchRouterLiveModels(env);
+      const models = buildModels(env, liveLimitsMap(router.info));
       const catalog = models
         .getModels()
-        .map((m) => ({ provider: m.provider, id: m.id, name: m.name }));
+        .map((m) => ({
+          provider: m.provider,
+          id: m.id,
+          name: m.name,
+          contextWindow: m.contextWindow,
+          maxTokens: m.maxTokens,
+        }));
       let def: { provider: string; id: string } | null = null;
       try {
         def = resolveDefaultModel(env, models);
       } catch {
         def = null;
       }
-      const router = await fetchRouterLiveModels(env);
       return Response.json({
         default: def,
         configured: {
@@ -412,7 +462,7 @@ export default {
           google: Boolean(nonEmpty(env?.GEMINI_API_KEY)),
         },
         catalog,
-        router,
+        router: { baseUrl: router.baseUrl, live: router.live },
       });
     }
 

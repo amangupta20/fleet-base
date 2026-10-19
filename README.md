@@ -238,7 +238,7 @@ curl localhost:9876/models
 # -> {
 #   "default": { "provider": "router", "id": "llama-3.1-8b" },
 #   "configured": { "router": true, "opencode-go": false, "openai": false, "google": false },
-#   "catalog": [ { "provider": "router", "id": "...", "name": "..." }, ... ],
+#   "catalog": [ { "provider": "router", "id": "...", "name": "...", "contextWindow": 1048576, "maxTokens": 131072 }, ... ],
 #   "router": { "baseUrl": "http://localhost:11434/v1", "live": ["llama-3.1-8b", ...] }
 # }
 ```
