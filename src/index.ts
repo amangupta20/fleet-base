@@ -266,6 +266,65 @@ export class Assistant extends Agent<Env> {
       .getModels()
       .map((m) => ({ provider: m.provider, id: m.id, name: m.name }));
   }
+
+  // Transcript tail for debugging: pi records generation failures here, so a
+  // terse `reason: "model_error"` can be traced to the underlying message.
+  async recentMessages(limit?: unknown) {
+    const count =
+      typeof limit === "number" && Number.isFinite(limit)
+        ? Math.min(Math.max(Math.floor(limit), 1), 100)
+        : 20;
+    const entries = await this.harness.session().messages();
+    return entries.slice(-count).map((entry) => summarizeEntry(entry));
+  }
+}
+
+// One JSON-safe line per transcript entry: kind + a short text preview.
+// Shapes vary (model messages, tool calls, error payloads), so this is
+// deliberately defensive — unknown shapes fall back to a JSON snippet.
+function summarizeEntry(entry: {
+  id?: unknown;
+  kind?: unknown;
+  model?: unknown;
+  data?: unknown;
+}): { id: unknown; kind: unknown; preview: string } {
+  const texts: string[] = [];
+  const push = (value: unknown) => {
+    if (typeof value === "string" && value.trim()) texts.push(value.trim());
+  };
+  const walk = (node: unknown, depth: number): void => {
+    if (texts.join("\n").length > 800 || depth > 4) return;
+    if (typeof node === "string") {
+      push(node);
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item, depth + 1);
+      return;
+    }
+    if (node && typeof node === "object") {
+      const record = node as Record<string, unknown>;
+      // Prefer human-meaningful keys first.
+      for (const key of ["text", "thinking", "errorMessage", "error", "reason", "message"]) {
+        if (typeof record[key] === "string") push(record[key] as string);
+      }
+      if (typeof record["name"] === "string" && typeof record["arguments"] !== "undefined") {
+        push(`tool:${record["name"] as string}`);
+      }
+      for (const value of Object.values(record)) {
+        if (value && typeof value === "object") walk(value, depth + 1);
+      }
+    }
+  };
+  walk((entry as { model?: unknown }).model, 0);
+  walk((entry as { data?: unknown }).data, 0);
+  const joined = texts.join("\n");
+  const preview = joined.length > 800 ? `${joined.slice(0, 800)}…` : joined;
+  return {
+    id: (entry as { id?: unknown }).id ?? null,
+    kind: (entry as { kind?: unknown }).kind ?? null,
+    preview: preview || "(no text content)",
+  };
 }
 
 function getAssistantStub(env: Env, name: string) {
@@ -273,11 +332,13 @@ function getAssistantStub(env: Env, name: string) {
     getByName?: (name: string) => {
       ask: (...args: unknown[]) => Promise<unknown>;
       listModels: () => Promise<unknown>;
+      recentMessages: (...args: unknown[]) => Promise<unknown>;
     };
     idFromName?: (name: string) => unknown;
     get?: (id: unknown) => {
       ask: (...args: unknown[]) => Promise<unknown>;
       listModels: () => Promise<unknown>;
+      recentMessages: (...args: unknown[]) => Promise<unknown>;
     };
   };
   if (typeof binding.getByName === "function") return binding.getByName(name);
@@ -406,6 +467,16 @@ export default {
       // celld activates the cell on demand, so we report resident:true once
       // the route itself is reachable. No per-cell residency probe yet.
       return Response.json({ name, resident: true });
+    }
+
+    const messagesMatch = url.pathname.match(/^\/agent\/([^/]+)\/messages$/);
+    if (messagesMatch && request.method === "GET") {
+      const name = decodeURIComponent(messagesMatch[1]);
+      const rawLimit = url.searchParams.get("limit");
+      const parsed = rawLimit === null ? undefined : Number(rawLimit);
+      const stub = getAssistantStub(env, name);
+      const messages = await stub.recentMessages(parsed);
+      return Response.json({ name, messages });
     }
 
     return new Response("not found", { status: 404 });
