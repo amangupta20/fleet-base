@@ -34,10 +34,11 @@ Use this as a **starter template** if you want to build your own self-hosted age
 curl POST /agent/:name/prompt
   └─> Worker `fetch()` (src/index.ts)
         ├─> GET /health → "ok"
+        ├─> GET /models → catalog + live router ids + env status (no DO needed)
         ├─> POST /agent/:name/prompt → ASSISTANT Durable Object stub
-        │     └─> Assistant.ask(prompt, requestId)
+        │     └─> Assistant.ask(prompt, requestId, model?)
         │           └─> PiHarness.prompt(prompt, { operationId })
-        │                 ├─> pi-ai models (OpenAI or Gemini)
+        │                 ├─> pi-ai models (own router, opencode-go, OpenAI, Gemini)
         │                 ├─> pi-durable registry (tools, e.g. `echo`)
         │                 └─> SQLite checkpoint (resume after crash)
         └─> GET /agent/:name/state → { name, resident: true }
@@ -50,7 +51,7 @@ Key pieces:
 | **Worker** | Routes HTTP to Durable Objects | `src/index.ts` default export `fetch()` |
 | **Assistant DO** | One SQLite-backed Durable Object per `:name`, via `agents` SDK `Agent` class | `src/index.ts` `export class Assistant` |
 | **PiHarness** | Lifecycle wrapper that opens a `pi-durable` `Harness` per DO (models + tool registry + storage) | `Assistant.harness` |
-| **Models** | `pi-ai` `createModels()` with OpenAI + Google providers, auth read from Worker env | `harness()` factory |
+| **Models** | `pi-ai` `createModels()` with four providers: own OpenAI-compatible router (`router`), OpenCode Go (`opencode-go`), OpenAI, Google — auth read from Worker env | `buildModels()` in [src/index.ts](src/index.ts) |
 | **Registry** | Tool registry; ships with a single `echo` tool | `echoTool` + `registry.install()` |
 | **Wrangler** | Minimal binding: `ASSISTANT` → `Assistant`, `v1` SQLite migration | `wrangler.jsonc` |
 | **celld** | Local runtime that emulates Workers + Durable Objects; persists to `.celld/dev/` | `npm run dev` → `celld dev` |
@@ -65,7 +66,7 @@ The `:name` in `/agent/:name/prompt` is the Durable Object name (`getByName`). `
 - **Node.js 22.19+** — check with `node --version` (this repo tested on Node 26)
 - **celld** binary on `PATH` — local Workers + DO runtime ([denoland/celld](https://github.com/denoland/celld))
 - **esbuild** on `PATH` (or `CELLD_ESBUILD` pointing at it) — `celld dev` and `celld deploy` use it to bundle `src/index.ts`
-- **One model key** — either OpenAI or Gemini (not both required, exactly one must be set)
+- **A model provider — one of:** your own OpenAI-compatible router (Ollama, LiteLLM, vLLM, LM Studio, own gateway — keyless OK), OpenCode Go (`OPENCODE_API_KEY`), OpenAI, or Gemini
 
 Install Node dependencies:
 
@@ -87,14 +88,31 @@ npm install
    npm install
    ```
 
-2. **Configure a provider key**
+2. **Configure a provider**
 
    ```sh
    cp .env.example .dev.vars
-   # then edit .dev.vars — set exactly one of:
+   # then edit .dev.vars — pick ONE path (or combine):
+   #
+   # Own router (e.g. local Ollama, keyless):
+   #   ROUTER_BASE_URL=http://localhost:11434/v1
+   #   ROUTER_MODEL=llama-3.1-8b
+   #
+   # Own router with a key (e.g. LiteLLM gateway):
+   #   ROUTER_BASE_URL=http://192.168.1.10:4000/v1
+   #   ROUTER_API_KEY=sk-...
+   #   ROUTER_MODEL=my-model
+   #
+   # OpenCode Go hosted inference:
+   #   OPENCODE_API_KEY=...
+   #   OPENCODE_MODEL=qwen3.8-flash   # optional; else catalog default
+   #
+   # Or the big APIs:
    #   OPENAI_API_KEY=sk-...
    #   GEMINI_API_KEY=...
    ```
+
+   `GET /models` (below) shows the live catalog so you can fetch-then-choose without guessing ids.
 
    `celld dev` reads `.dev.vars` next to the Wrangler config, falling back to `.env` then `.env.local` (`.env.local` overrides `.env`). `celld deploy` does **not** read these files.
 
@@ -138,24 +156,49 @@ npm install
 
 | Var | Needed for `celld dev`? | Purpose |
 |---|---|---|
-| `OPENAI_API_KEY` | Yes, unless `GEMINI_API_KEY` is set | Pi OpenAI provider (`gpt-5-mini` default) |
-| `GEMINI_API_KEY` | Yes, unless `OPENAI_API_KEY` is set | Pi Google provider (`gemini-2.5-flash` default) |
+| `ROUTER_BASE_URL` | Yes, for own-router path (defaults to Ollama `http://localhost:11434/v1` when `ROUTER_MODEL` is set) | Your gateway's OpenAI-compatible base URL |
+| `ROUTER_API_KEY` | Only if your router needs one (empty = keyless, e.g. Ollama) | Bearer key sent to the router |
+| `ROUTER_MODEL` | Yes, for own-router path — wins as the default model | Default model id on the router (e.g. `llama-3.1-8b`) |
+| `ROUTER_EXTRA_MODELS` | No | Comma-separated extra router ids to pre-register for per-request `model` use |
+| `OPENCODE_API_KEY` | Yes, for opencode-go path | OpenCode Go hosted inference key |
+| `OPENCODE_MODEL` | No (defaults to catalog's first model) | Pins the opencode-go default model |
+| `OPENAI_API_KEY` | Yes, for OpenAI path (unless another provider is set) | Pi OpenAI provider (`gpt-5-mini` default) |
+| `GEMINI_API_KEY` | Yes, for Gemini path (unless another provider is set) | Pi Google provider (`gemini-2.5-flash` default) |
 | `CELLD_BUCKET` | No (local uses on-disk store) | S3-compatible bucket, e.g. `s3://my-fleet` — bucket/fleet deploys only |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | No | Bucket credentials — deploys only |
 | `AWS_REGION` | No | e.g. `auto` for R2 — deploys only |
 | `S3_ENDPOINT` | No | e.g. `https://ACCOUNT_ID.r2.cloudflarestorage.com` — deploys only |
 
-See [.env.example](.env.example) — copy it to `.dev.vars` and fill in one provider key. Never commit `.dev.vars` / `.env` (already in [.gitignore](.gitignore)).
+See [.env.example](.env.example) — copy it to `.dev.vars` and configure one provider path. Never commit `.dev.vars` / `.env` (already in [.gitignore](.gitignore)).
 
 ### Model selection
 
-`resolveDefaultModel()` in [src/index.ts](src/index.ts) picks the default at construction:
+`resolveDefaultModel()` in [src/index.ts](src/index.ts) picks the default fresh sessions start with, first hit wins:
 
-- `OPENAI_API_KEY` set → `{ provider: "openai", id: "gpt-5-mini" }`
-- else `GEMINI_API_KEY` set → `{ provider: "google", id: "gemini-2.5-flash" }`
-- else throws — the Worker returns HTTP 500 with `fleet: set OPENAI_API_KEY or GEMINI_API_KEY in .dev.vars ...`
+1. `ROUTER_MODEL` set → `{ provider: "router", id: ROUTER_MODEL }`
+2. `OPENCODE_API_KEY` + `OPENCODE_MODEL` set → `{ provider: "opencode-go", id: OPENCODE_MODEL }`
+3. `OPENAI_API_KEY` set → `{ provider: "openai", id: "gpt-5-mini" }`
+4. `GEMINI_API_KEY` set → `{ provider: "google", id: "gemini-2.5-flash" }`
+5. `OPENCODE_API_KEY` set → `{ provider: "opencode-go", id: OPENCODE_MODEL or catalog default }`
+6. `ROUTER_BASE_URL` set → `{ provider: "router", id: ROUTER_MODEL or llama-3.1-8b }`
+7. else throws — the Worker returns HTTP 500 listing the options.
 
-The harness factory re-checks keys at runtime so misconfiguration fails loudly instead of silently falling back.
+So: set `ROUTER_MODEL` and your router wins; set only `OPENCODE_API_KEY` and opencode-go wins. Nothing is required from OpenAI/Gemini.
+
+Three ways to choose a model beyond the default (env var **or** fetch-and-choose):
+
+- **Env var:** `ROUTER_MODEL` / `ROUTER_EXTRA_MODELS` / `OPENCODE_MODEL` in `.dev.vars` (`celld dev` rebuilds on config change).
+- **Fetch:** `GET /models` returns the static catalog, per-provider `configured` flags, the resolved `default`, and live ids fetched from your router's `/models` endpoint (`router.live`, `null` when unreachable).
+- **Per-request override:** `POST /agent/:name/prompt` accepts `model` as `"provider/id"` or `{"provider","id"}`. The agent is session-pinned to it until changed. Unknown ids return HTTP 400 with a pointer to `GET /models`. Router ids must be pre-registered via `ROUTER_MODEL`/`ROUTER_EXTRA_MODELS` (pi resolves the session model against the static catalog).
+
+```sh
+curl localhost:9876/models | python3 -m json.tool | head -n 40
+curl -X POST localhost:9876/agent/test/prompt \
+  -H 'content-type: application/json' \
+  -d '{"prompt":"say hi","model":"opencode-go/qwen3.8-flash"}'
+```
+
+The harness factory re-checks configuration at runtime so misconfiguration fails loudly instead of silently falling back.
 
 ### Wrangler ([wrangler.jsonc](wrangler.jsonc))
 
@@ -186,14 +229,30 @@ Returns `ok` (`text/plain`). Use for readiness probes.
 curl localhost:9876/health
 ```
 
+### `GET /models`
+
+Fetch-then-choose: static catalog across all four providers (no DO activation), which providers are configured from env, the resolved default, and live ids from your router's OpenAI-compatible `/models` endpoint.
+
+```sh
+curl localhost:9876/models
+# -> {
+#   "default": { "provider": "router", "id": "llama-3.1-8b" },
+#   "configured": { "router": true, "opencode-go": false, "openai": false, "google": false },
+#   "catalog": [ { "provider": "router", "id": "...", "name": "..." }, ... ],
+#   "router": { "baseUrl": "http://localhost:11434/v1", "live": ["llama-3.1-8b", ...] }
+# }
+```
+
+`router.live` is `null` when the router is unreachable — the static catalog still lists pre-registered ids.
+
 ### `POST /agent/:name/prompt`
 
-Run a prompt on the named agent. Body must be JSON with a non-empty `prompt` string. Optional `requestId` (alias `operationId`) for idempotency.
+Run a prompt on the named agent. Body must be JSON with a non-empty `prompt` string. Optional `requestId` (alias `operationId`) for idempotency, and optional `model` (`"provider/id"` or `{"provider","id"}`) to pin this agent's session to another model.
 
 ```sh
 curl -X POST localhost:9876/agent/alice/prompt \
   -H 'content-type: application/json' \
-  -d '{"prompt":"echo hello back to me","requestId":"req-123"}'
+  -d '{"prompt":"echo hello back to me","requestId":"req-123","model":"router/llama-3.1-8b"}'
 ```
 
 Response:
@@ -217,8 +276,8 @@ Errors:
 
 | Status | When |
 |---|---|
-| `400` | Invalid JSON body, or `body.prompt` missing/empty |
-| `500` | Neither provider key is set |
+| `400` | Invalid JSON body, `body.prompt` missing/empty, or unknown/malformed `body.model` |
+| `500` | No provider configured (none of router / opencode-go / OpenAI / Gemini set) |
 | `404` | Any other path/method |
 
 ### `GET /agent/:name/state`
@@ -366,7 +425,9 @@ celld deploy . --bucket "$CELLD_BUCKET" --endpoint "$S3_ENDPOINT" --region "$AWS
 
 | Symptom | Fix |
 |---|---|
-| `500 fleet: set OPENAI_API_KEY or GEMINI_API_KEY...` | `cp .env.example .dev.vars`, set exactly one key, restart `celld dev` |
+| `500 fleet: no model provider configured...` | `cp .env.example .dev.vars`, configure one path (router / opencode-go / OpenAI / Gemini), restart `celld dev` |
+| Model answers but ignores the `echo` tool | Weaker routers/models may not tool-call reliably — try a stronger model id, check `GET /models` live ids match what the router actually serves |
+| Router `fetch failed` / empty reply | Router not running or wrong `ROUTER_BASE_URL` — `curl $ROUTER_BASE_URL/models` directly; keyless servers need `ROUTER_API_KEY` empty |
 | `celld: command not found` | Install celld, ensure it's on `PATH` |
 | `esbuild: command not found` / bundle error | Install esbuild or set `CELLD_ESBUILD=/path/to/esbuild` |
 | Port `9876` in use | Stop the other `celld dev`, or check what's listening |
