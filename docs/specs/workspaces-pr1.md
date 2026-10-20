@@ -53,6 +53,9 @@ otherwise share a directory. The id is deterministic and exposed in
    `box_mismatch` from the daemon and the same one-retry path.
 2. **Routes.**
    - `POST /workspace` — enroll/rotate, no auth (loopback admin surface).
+   - `FLEET_BOX_ROOT`, `FLEET_BOX_ID_FILE`, and `FLEET_BOX_ID` are test-only
+     overrides for redirecting or pinning a workspace in E2E; production uses
+     `.celld/workspaces` and `.celld/box-id`.
    - `POST /workspace/reset` — auth.
    - `POST /fs/read {path, binary?, offset?, length?}`, `/fs/write`,
      `/fs/stat`, `/fs/canonical`.
