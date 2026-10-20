@@ -311,7 +311,7 @@ curl 'localhost:9876/agents?limit=50&prefix=a'
 # -> {"agents":[{"name":"alice","lastActive":"2026-10-20T06:41:12.345Z","prompts":3}],"count":1}
 ```
 
-The registry stores **names, timestamps, and prompt counts only — never prompt text or transcripts**. It is one plain `Registry` Durable Object in the same fleet/bucket as the agents, so every browser sees the same list instead of a per-browser `localStorage` list. Activity moves on prompt POSTs only: `/messages`, `/state`, and `/reset` do not touch it, and reset keeps the entry. Bookkeeping is best-effort — if the registry fails, the prompt still runs. A re-POST with the same `requestId` is idempotent for the run but still bumps `prompts` by one, because touch runs once per HTTP POST, not per unique submission. Storage/binding errors return `500`; this route never returns `404`.
+The registry stores **names, timestamps, and prompt counts only — never prompt text or transcripts**. It is one plain `Registry` Durable Object in the same fleet/bucket as the agents, so every browser sees the same list instead of a per-browser `localStorage` list. Activity moves on prompt POSTs only: `/messages`, `/state`, and `/reset` do not touch it, and reset keeps the entry. Bookkeeping is best-effort — if the registry fails, the prompt still runs. A re-POST with the same `requestId` is idempotent for the run but still bumps `prompts` by one, because touch runs once per accepted prompt POST, not per unique submission; a POST rejected for an unknown or malformed model never reaches the touch. Storage/binding errors return `500`; this route never returns `404`.
 
 ### `POST /agent/:name/prompt`
 

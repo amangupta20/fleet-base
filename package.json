@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Self-hosted agents that outlive your laptop. One Worker, two Durable Objects, SQLite resume, local-first by default.",
+  "description": "Self-hosted agents that outlive your laptop. One Worker, two Durable Objects, SQLite resume, local-only by default.",
   "license": "MIT",
   "repository": {
     "type": "git",

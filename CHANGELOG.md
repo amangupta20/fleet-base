@@ -9,7 +9,7 @@ First tag. This is a base, not a launch.
 - The first kill -9 test looked like a failed resume: the demo wrote its output
   under the project tree, `celld dev` saw the write, rebuilt and restarted the
   app mid-prompt. Moving the output outside the tree made the resume test show
-  the real behavior. It is now in the verification log, not hidden.
+  the real behavior. The test is in the PR verification log.
 - One killed prompt left a `pi.assistant` transcript entry with the preview
   `Connection error.` The re-POST returned the full answer under the same
   `operationId`, but the failed partial was still there. Resume is not a clean
@@ -34,19 +34,3 @@ First tag. This is a base, not a launch.
   git tag, not a registry release.
 - Coverage thresholds, Playwright, Dependabot, and a wiki. None of them make
   the first run more honest.
-
-### Works
-
-- `GET /health`, `GET /models`, `GET /agents`, prompt, state, transcript and
-  reset routes.
-- A model call with the `echo` tool loop, idempotent `requestId` replay, and
-  SQLite-checkpointed resume after `kill -9`.
-- Three terminal GIFs in `docs/demo`: fresh boot, kill -9 resume, and a
-  second terminal prompt. See `docs/demo/README.md` for the recording notes.
-- README 30-second proof rerun on `7eb7e7b`: `/health` returned `ok`, the
-  prompt returned `text`, `submissionId`, `operationId`, and `status: done`.
-  Reset cleared the transcript and kept the `/agents` entry.
-- Local `celld dev` with one provider among the OpenAI-compatible router,
-  OpenCode Go, OpenAI, or Gemini.
-- Single-node bucket deploy scripts and the systemd unit, as documented
-  examples. Not exercised on this laptop for this tag.

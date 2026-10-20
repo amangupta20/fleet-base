@@ -3,9 +3,10 @@
 Status: implemented on `deslop/v0.1.0`.
 
 Baseline: `7eb7e7b`, the commit named in the request. `origin/main` moved to
-`b6e898e` before this branch started. The branch stays on `7eb7e7b` so the
-deslop diff does not carry the newer name/model validation work; that commit
-keeps its own history on `main`.
+`b6e898e` before this branch started. The branch starts at `7eb7e7b` and merges
+`b6e898e` before the PR so the newer reset docs are not reverted. The deslop
+diff is judged against `b6e898e`, the merge-base with `main`; the original base
+is still in the history.
 
 ## Goal
 

@@ -52,6 +52,13 @@ function nonEmpty(value: string | undefined): string | undefined {
   return clean ? clean : undefined;
 }
 
+function badRequest(err: unknown): Response {
+  return Response.json(
+    { error: err instanceof Error ? err.message : String(err) },
+    { status: 400 },
+  );
+}
+
 function authEnv(env: Env) {
   const workerEnv = (env ?? {}) as unknown as Record<string, string | undefined>;
   return {
@@ -198,6 +205,18 @@ function parseModelRef(
   throw new Error(
     `malformed model ${JSON.stringify(model)}: use "provider/id" or {"provider","id"}`,
   );
+}
+
+// HTTP-layer model check, run before the registry touch so a rejected model
+// never counts as activity.
+function assertKnownModel(env: Env, model: unknown): void {
+  const wanted = parseModelRef(model);
+  if (!wanted) return;
+  if (!buildModels(env).getModel(wanted.provider, wanted.id)) {
+    throw new Error(
+      `unknown model "${wanted.provider}/${wanted.id}"; see GET /models for the catalog`,
+    );
+  }
 }
 
 // Proof-of-loop tool: proves the model -> tool -> transcript loop works
@@ -375,6 +394,18 @@ function normalizeAgentName(raw: string): string {
     throw new Error(`agent name must be at most ${MAX_AGENT_NAME_LENGTH} characters`);
   }
   return name;
+}
+
+// Every route resolves a name through this, so encoded and plain spellings
+// (e.g. "%20alice%20" vs "alice") always address the same assistant.
+function agentNameFromPath(segment: string): string {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(segment);
+  } catch {
+    throw new Error("agent name is not valid percent-encoding");
+  }
+  return normalizeAgentName(decoded);
 }
 
 export class Registry extends DurableObject {
@@ -636,6 +667,12 @@ export default {
             ? ((body as { operationId: string }).operationId as string)
             : undefined;
       const model = (body as { model?: unknown }).model;
+      let name: string;
+      try {
+        name = agentNameFromPath(promptMatch[1]);
+      } catch (err) {
+        return badRequest(err);
+      }
       try {
         ensureConfigured(env);
       } catch (err) {
@@ -644,7 +681,17 @@ export default {
           { status: 500 },
         );
       }
-      const name = decodeURIComponent(promptMatch[1]);
+      // Model validation runs before the registry touch, so a rejected model
+      // never counts as activity.
+      try {
+        assertKnownModel(env, model);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (/^(unknown model|malformed model)/.test(message)) {
+          return Response.json({ error: message }, { status: 400 });
+        }
+        throw err;
+      }
       // Best effort: registry bookkeeping must never fail a prompt.
       try {
         await getRegistryStub(env).touch(name);
@@ -666,7 +713,12 @@ export default {
 
     const stateMatch = url.pathname.match(/^\/agent\/([^/]+)\/state$/);
     if (stateMatch && request.method === "GET") {
-      const name = decodeURIComponent(stateMatch[1]);
+      let name: string;
+      try {
+        name = agentNameFromPath(stateMatch[1]);
+      } catch (err) {
+        return badRequest(err);
+      }
       // Best effort, deliberately coarse: the binding is addressable and
       // celld activates the cell on demand, so we report resident:true once
       // the route itself is reachable. No per-cell residency probe yet.
@@ -675,7 +727,12 @@ export default {
 
     const messagesMatch = url.pathname.match(/^\/agent\/([^/]+)\/messages$/);
     if (messagesMatch && request.method === "GET") {
-      const name = decodeURIComponent(messagesMatch[1]);
+      let name: string;
+      try {
+        name = agentNameFromPath(messagesMatch[1]);
+      } catch (err) {
+        return badRequest(err);
+      }
       const rawLimit = url.searchParams.get("limit");
       const parsed = rawLimit === null ? undefined : Number(rawLimit);
       const stub = getAssistantStub(env, name);
@@ -685,7 +742,12 @@ export default {
 
     const resetMatch = url.pathname.match(/^\/agent\/([^/]+)\/reset$/);
     if (resetMatch && request.method === "POST") {
-      const name = decodeURIComponent(resetMatch[1]);
+      let name: string;
+      try {
+        name = agentNameFromPath(resetMatch[1]);
+      } catch (err) {
+        return badRequest(err);
+      }
       const stub = getAssistantStub(env, name);
       await stub.resetSession();
       return Response.json({ name, reset: true });
