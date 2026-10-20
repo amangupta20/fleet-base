@@ -693,9 +693,8 @@ The box is a local trust boundary, not a multi-tenant hard boundary.
 - **Git gates.** Only `https://`; no credentials in the URL; private, loopback,
   link-local, and `.local` hosts are rejected; DNS is resolved and checked for
   private addresses; `GIT_ALLOW_PROTOCOL=https` blocks `file://`/`ext::`;
-  `--` precedes the URL. DNS is resolved and checked; git re-resolves at
-  connect time, so a deliberate rebinding race is outside this local trust
-  boundary.
+  `--` precedes the URL. Git re-resolves at connect time, so a deliberate
+  rebinding race is outside this local trust boundary.
 - **Reset kills first.** `POST /reset` asks the daemon to kill running commands
   for that workspace, then deletes the directory and token entry. The
   transcript reset is separate and durable.

@@ -1202,8 +1202,8 @@ export default {
       }
       // Best effort, deliberately coarse: the binding is addressable and
       // celld activates the cell on demand, so we report resident:true once
-      // the route itself is reachable. The workspace fields are read from DO
-      // storage; the token is never returned.
+      // the route itself is reachable. The workspace id is derived from the DO
+      // id; the token is never returned.
       const stub = getAssistantStub(env, name);
       const workspace = (await stub.workspaceState()) as Record<string, unknown>;
       return Response.json({ name, resident: true, ...workspace });
