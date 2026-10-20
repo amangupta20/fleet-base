@@ -22,10 +22,9 @@ import {
  * ExecutionEnv returns not_supported; the box daemon is not a second filesystem
  * API and we do not want half-working methods.
  */
-export const VIRTUAL_ROOT = "/workspace";
+const VIRTUAL_ROOT = "/workspace";
 const SAFE_TIMEOUT_MS = 15_000;
 const EXEC_TIMEOUT_MS = 120_000;
-const CLONE_TIMEOUT_MS = 310_000;
 
 type Context = Parameters<ExecutionEnv["absolutePath"]>[1];
 
@@ -188,7 +187,7 @@ function base64ToBytes(value: string): Uint8Array {
 }
 
 /** Byte offsets for `BinaryReader.scanLines`; BOM bytes are not counted in decoded sizes. */
-export function scanLines(
+function scanLines(
   bytes: Uint8Array,
   startLine: number,
   endLine?: number,
@@ -233,7 +232,7 @@ type RequestOptions = {
   retried?: boolean;
 };
 
-export type DaemonEnvOptions = {
+type DaemonEnvOptions = {
   baseUrl: string;
   binding: WorkspaceBinding;
   rehandshake: Rehandshake;
@@ -258,14 +257,6 @@ export class DaemonEnv implements ExecutionEnv {
 
   get id(): string {
     return `box:${this.binding.boxId}:${this.binding.id}`;
-  }
-
-  get tier(): SandboxTier {
-    return this.binding.tier;
-  }
-
-  get boxId(): string {
-    return this.binding.boxId;
   }
 
   describe(): string {
@@ -666,5 +657,3 @@ export class DaemonEnv implements ExecutionEnv {
     // request. Deliberately not an error, because this is a lifecycle no-op.
   }
 }
-
-export { DaemonRequestError };

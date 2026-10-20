@@ -632,8 +632,9 @@ because bwrap sets no-new-privileges.
 - **Output:** 10 MB retained; larger output is truncated and, past the bash
   tool's spill threshold, spilling is reported.
 - **Quota:** 200 MB per workspace by default, checked on write and clone;
-  `POST /agent/:name/config {"quotaMb":50}` lowers it. `/workspace/info` and
-  the daemon's `du` report current bytes.
+  `POST /agent/:name/config {"quotaMb":50}` lowers it. `/state` shows the
+  configured quota; a write or clone that would cross it returns
+  `quota_exceeded`.
 - **Path jail:** every `/fs/*` path is mapped to the workspace with
   `path.resolve(workspace, target)`, rejected unless it is the workspace or
   starts with `workspace + path.sep`, checked component by component with

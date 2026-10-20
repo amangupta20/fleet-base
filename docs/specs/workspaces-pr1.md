@@ -50,10 +50,10 @@ otherwise share a directory. The id is deterministic and exposed in
    re-handshakes once and retries.
 2. **Routes.**
    - `POST /workspace` — enroll/rotate, no auth (loopback admin surface).
-   - `POST /workspace/info`, `/workspace/tier`, `/workspace/reset` — auth.
+   - `POST /workspace/reset` — auth.
    - `POST /fs/read {path, binary?, offset?, length?}`, `/fs/write`,
-     `/fs/stat`, `/fs/list`, `/fs/mkdir`, `/fs/canonical`.
-   - `POST /git/clone {url, dir?}`, `/git/fetch {repo?}`, `/git/status {repo?}`.
+     `/fs/stat`, `/fs/canonical`.
+   - `POST /git/clone {url, dir?}`, `/git/status {repo?}`.
    - `POST /exec {cmd, timeoutMs?, net?, spill?}` — tier t1 only.
    - `GET /health` — the only unauthenticated GET.
    - No `/fs/edit`: the pi edit tool uses `readTextFile` + `writeFile`.

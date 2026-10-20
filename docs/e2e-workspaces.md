@@ -341,10 +341,14 @@ Quota:
 
 ```text
 issue (tier t1, quotaMb 1)
-quota write -> 413 quota_exceeded workspace uses 114 bytes; quota is 1 MB
-raise quota -> 200 {'tier':'t1','quotaMb':200}
+quota write -> 413 quota_exceeded workspace uses 70 bytes; quota is 1 MB
+POST /workspace {id, tier:"t1", quotaMb:200} -> 200 (new token; the old one is invalid)
 write after raise -> 200 {'path':'/workspace/small.txt','bytes':2}
+removed routes (/workspace/info, /git/fetch, /fs/list) -> 404
 ```
+
+The old token is invalidated by the rotate; the Worker's 401 re-handshake is
+what recovers it.
 
 ## Reproduce
 

@@ -14,7 +14,7 @@
 //
 // See docs/specs/workspaces-pr1.md.
 
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import {
   createHash,
   randomBytes,
@@ -28,7 +28,6 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
-  mkdtempSync,
   openSync,
   readFileSync,
   readdirSync,
@@ -40,7 +39,6 @@ import {
 } from "node:fs";
 import { createServer } from "node:http";
 import { isIPv4, isIPv6 } from "node:net";
-import { tmpdir } from "node:os";
 import {
   basename,
   dirname,
@@ -291,13 +289,13 @@ function bearer(req) {
 }
 
 function authenticate(req, id) {
-  const index = readIndex();
-  const entry = index.workspaces[id];
+  const entry = readIndex().workspaces[id];
   if (!entry) fail(401, "unauthorized", "workspace is not enrolled");
   if (!tokensEqual(entry.tokenHash, bearer(req))) {
     fail(401, "unauthorized", "missing or invalid workspace token");
   }
-  return { index, entry, dir: workspaceDir(id) };
+  workspaceDir(id);
+  return { entry };
 }
 
 function markerPath(dir) {
@@ -336,6 +334,11 @@ function issueWorkspace(body) {
   }
   const index = readIndex();
   const previous = index.workspaces[id];
+  if (previous?.tier === "t1" && tier === "t0") {
+    for (const [pid, value] of activeExecs) {
+      if (value.id === id) killTree(pid);
+    }
+  }
   let lostFrom;
   let created = !existsSync(dir);
 
@@ -378,29 +381,6 @@ function issueWorkspace(body) {
     created,
     ...(lostFrom ? { lostFrom } : {}),
   };
-}
-
-function workspaceInfo(id, entry, dir) {
-  return {
-    id,
-    boxId: BOX_ID,
-    tier: entry.tier,
-    quotaMb: quotaMbFor(entry),
-    bytes: bytesFor(dir),
-  };
-}
-
-function updateWorkspace(id, entry, index, body) {
-  const tier = body.tier ?? entry.tier;
-  if (!TIERS.has(tier)) fail(400, "bad_tier", 'tier must be "t0" or "t1"');
-  const quotaMb =
-    body.quotaMb === undefined ? quotaMbFor(entry) : Number(body.quotaMb);
-  if (!Number.isInteger(quotaMb) || quotaMb < 1 || quotaMb > 4096) {
-    fail(400, "bad_quota", "quotaMb must be an integer from 1 to 4096");
-  }
-  index.workspaces[id] = { ...entry, tier, quotaMb };
-  writeIndex(index);
-  return { id, tier, quotaMb };
 }
 
 function virtualFor(root, target) {
@@ -619,59 +599,6 @@ function fsCanonical(id) {
   return (body) => {
     const target = resolveInWorkspace(dir, body.path);
     return { path: virtualFor(dir, target) };
-  };
-}
-
-function fsList(id) {
-  const dir = workspaceDir(id);
-  return (body) => {
-    const target = resolveInWorkspace(dir, body.path ?? ".");
-    let names;
-    try {
-      names = readdirSync(target);
-    } catch {
-      fail(
-        404,
-        "not_found",
-        `directory ${JSON.stringify(body.path ?? ".")} does not exist`,
-      );
-    }
-    const entries = names.sort().flatMap((name) => {
-      const hostPath = join(target, name);
-      try {
-        const info = lstatSync(hostPath);
-        const kind = info.isSymbolicLink()
-          ? "symlink"
-          : info.isDirectory()
-            ? "directory"
-            : "file";
-        return [
-          {
-            name,
-            path: virtualFor(dir, hostPath),
-            kind,
-            size: info.size,
-            mtimeMs: info.mtimeMs,
-          },
-        ];
-      } catch {
-        return [];
-      }
-    });
-    return { path: virtualFor(dir, target), entries };
-  };
-}
-
-function fsMkdir(id) {
-  const dir = workspaceDir(id);
-  return (body) => {
-    const target = resolveInWorkspace(dir, body.path);
-    if (existsSync(target) && !statSync(target).isDirectory()) {
-      fail(400, "not_a_directory", `${body.path} is not a directory`);
-    }
-    const created = !existsSync(target);
-    mkdirSync(target, { recursive: true });
-    return { path: virtualFor(dir, target), created };
   };
 }
 
@@ -1038,32 +965,6 @@ async function gitClone(id, entry, body) {
   };
 }
 
-async function gitFetch(id, body) {
-  const workspace = { id, root: workspaceDir(id) };
-  const repo = repoRelative(workspace, body.repo);
-  const result = await runInBox(
-    ["/usr/bin/git", "-C", repo, "fetch", "--depth", "1", "--no-tags"],
-    {
-      workspace,
-      net: true,
-      timeoutMs: CLONE_TIMEOUT_MS,
-      extraEnv: GIT_ENV,
-    },
-  );
-  if (result.exitCode !== 0) {
-    fail(
-      400,
-      "git_fetch_failed",
-      `${result.stderr || result.stdout}`.trim() || "git fetch failed",
-    );
-  }
-  return {
-    path: posix.join(VIRTUAL_ROOT, repo),
-    stdout: result.stdout,
-    stderr: result.stderr,
-  };
-}
-
 async function gitStatus(id, body) {
   const workspace = { id, root: workspaceDir(id) };
   const repo = repoRelative(workspace, body.repo);
@@ -1132,18 +1033,10 @@ async function route(req, res) {
   if (typeof id !== "string") {
     fail(400, "bad_workspace", "missing X-Fleet-Workspace");
   }
-  const { index, entry, dir } = authenticate(req, id);
+  const { entry } = authenticate(req, id);
   const body = await readJson(req);
 
   switch (url.pathname) {
-    case "/workspace/info":
-      return sendJson(res, 200, workspaceInfo(id, entry, dir));
-    case "/workspace/tier": {
-      if (body.tier === "t0" && entry.tier === "t1") {
-        await killWorkspaceExecs(id);
-      }
-      return sendJson(res, 200, updateWorkspace(id, entry, index, body));
-    }
     case "/workspace/reset":
       return sendJson(res, 200, await resetWorkspace(id));
     case "/fs/read":
@@ -1152,16 +1045,10 @@ async function route(req, res) {
       return sendJson(res, 200, fsWrite(id, entry)(body));
     case "/fs/stat":
       return sendJson(res, 200, fsStat(id)(body));
-    case "/fs/list":
-      return sendJson(res, 200, fsList(id)(body));
-    case "/fs/mkdir":
-      return sendJson(res, 200, fsMkdir(id)(body));
     case "/fs/canonical":
       return sendJson(res, 200, fsCanonical(id)(body));
     case "/git/clone":
       return sendJson(res, 200, await gitClone(id, entry, body));
-    case "/git/fetch":
-      return sendJson(res, 200, await gitFetch(id, body));
     case "/git/status":
       return sendJson(res, 200, await gitStatus(id, body));
     case "/exec":
