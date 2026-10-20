@@ -18,7 +18,8 @@
     "node": ">=22.19.0"
   },
   "scripts": {
-    "dev": "celld dev",
+    "dev": "node scripts/dev.mjs",
+    "box": "node scripts/box.mjs",
     "deploy": "node scripts/deploy.mjs",
     "deploy:dry": "node scripts/deploy.mjs --dry-run"
   },

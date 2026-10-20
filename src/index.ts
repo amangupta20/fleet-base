@@ -13,7 +13,19 @@ import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completio
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { googleProvider } from "@earendil-works/pi-ai/providers/google";
 import { opencodeGoProvider } from "@earendil-works/pi-ai/providers/opencode-go";
-import { createRegistry, Harness, defineTool } from "@earendil-works/pi-durable";
+import {
+  createRegistry,
+  defineExtension,
+  defineTool,
+  Harness,
+  section,
+} from "@earendil-works/pi-durable";
+import { createCodingTools } from "@earendil-works/pi-durable/tools";
+import {
+  DaemonEnv,
+  type SandboxTier,
+  type WorkspaceBinding,
+} from "./box-env.ts";
 
 export interface Env {
   ASSISTANT: DurableObjectNamespace;
@@ -32,6 +44,9 @@ export interface Env {
   OPENCODE_MODEL?: string;
   OPENAI_API_KEY?: string;
   GEMINI_API_KEY?: string;
+  // Loopback box executor (scripts/box.mjs). Default:
+  // http://127.0.0.1:9877. Loopback only; the daemon refuses anything else.
+  FLEET_EXECUTOR_URL?: string;
 }
 
 const ROUTER_PROVIDER = "router";
@@ -231,6 +246,225 @@ const echoTool = defineTool({
   },
 });
 
+// ---- working files -------------------------------------------------------
+
+const ROOT_WORKSPACE_ID = "1";
+const WORKSPACE_KEY_PREFIX = "fleet:workspace:v1:";
+const SANDBOX_TIER_KEY_PREFIX = "fleet:sandboxTier:v1:";
+const SANDBOX_QUOTA_KEY_PREFIX = "fleet:sandboxQuota:v1:";
+const DEFAULT_EXECUTOR_URL = "http://127.0.0.1:9877";
+const DEFAULT_QUOTA_MB = 200;
+const MAX_QUOTA_MB = 4096;
+
+type WorkspaceRecord = WorkspaceBinding & { createdAt?: string };
+
+function workspaceKey(conversationId: string): string {
+  return `${WORKSPACE_KEY_PREFIX}${conversationId}`;
+}
+
+function tierKey(conversationId: string): string {
+  return `${SANDBOX_TIER_KEY_PREFIX}${conversationId}`;
+}
+
+function quotaKey(conversationId: string): string {
+  return `${SANDBOX_QUOTA_KEY_PREFIX}${conversationId}`;
+}
+
+function parseSandboxTier(value: unknown): SandboxTier {
+  if (value === "t0" || value === "t1") return value;
+  throw new Error('sandbox must be "t0" or "t1"');
+}
+
+function parseQuota(value: unknown): number {
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 1 || number > MAX_QUOTA_MB) {
+    throw new Error(`quotaMb must be an integer from 1 to ${MAX_QUOTA_MB}`);
+  }
+  return number;
+}
+
+function executorUrl(env: Env): string {
+  const raw = nonEmpty(env?.FLEET_EXECUTOR_URL) ?? DEFAULT_EXECUTOR_URL;
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`FLEET_EXECUTOR_URL is not a URL: ${raw}`);
+  }
+  if (parsed.protocol !== "http:") {
+    throw new Error("FLEET_EXECUTOR_URL must be http:// (the box binds loopback)");
+  }
+  if (!["127.0.0.1", "localhost"].includes(parsed.hostname)) {
+    throw new Error("FLEET_EXECUTOR_URL must point at loopback");
+  }
+  return raw.replace(/\/+$/, "");
+}
+
+async function daemonJson(
+  url: string,
+  options: {
+    body?: unknown;
+    token?: string;
+    workspace?: string;
+    timeoutMs?: number;
+  },
+): Promise<{ status: number; json: Record<string, unknown> | null }> {
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(options.token ? { authorization: `Bearer ${options.token}` } : {}),
+        ...(options.workspace
+          ? { "x-fleet-workspace": options.workspace }
+          : {}),
+      },
+      body: JSON.stringify(options.body ?? {}),
+      signal: AbortSignal.timeout(options.timeoutMs ?? 10_000),
+    });
+  } catch (error) {
+    throw new Error(
+      `box executor is unreachable at ${new URL(url).origin}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+  const text = await response.text();
+  let json: Record<string, unknown> | null = null;
+  try {
+    json = text ? (JSON.parse(text) as Record<string, unknown>) : null;
+  } catch {
+    json = null;
+  }
+  return { status: response.status, json };
+}
+
+const codingTools = createCodingTools();
+
+function requireCodingTool(name: string) {
+  const tool = codingTools.tools?.find((entry) => entry.name === name);
+  if (!tool) throw new Error(`pi-durable coding tool ${name} is missing`);
+  return tool;
+}
+
+const readTool = {
+  ...requireCodingTool("read"),
+  replay: "safe" as const,
+};
+
+const writeTool = {
+  ...requireCodingTool("write"),
+  replay: "unsafe" as const,
+};
+
+const editTool = {
+  ...requireCodingTool("edit"),
+  replay: "unsafe" as const,
+};
+
+const bashBase = requireCodingTool("bash");
+const bashTool = {
+  ...bashBase,
+  replay: "unsafe" as const,
+  execute: (
+    args: { command: string; timeout?: number },
+    api: Parameters<typeof bashBase.execute>[1],
+    context: Parameters<typeof bashBase.execute>[2],
+  ) => {
+    const requested =
+      typeof args.timeout === "number" && Number.isFinite(args.timeout)
+        ? args.timeout
+        : 120;
+    return bashBase.execute(
+      { ...args, timeout: Math.min(Math.max(requested, 1), 120) },
+      api,
+      context,
+    );
+  },
+};
+
+function boxEnv(api: { env?: unknown }): DaemonEnv {
+  if (!(api.env instanceof DaemonEnv)) {
+    throw new Error("this tool needs the fleet box environment");
+  }
+  return api.env;
+}
+
+const gitCloneTool = defineTool({
+  name: "git_clone",
+  description:
+    "Clone an https git repository into /workspace. Local, private, and non-https URLs are rejected by the box. Replay-unsafe: a crash may leave a partial clone.",
+  parameters: Type.Object({
+    url: Type.String({ description: "https:// repository URL" }),
+    dir: Type.Optional(
+      Type.String({ description: "Optional simple directory name; defaults to the repo name" }),
+    ),
+  }),
+  replay: "unsafe",
+  async execute({ url, dir }, api) {
+    const env = boxEnv(api);
+    const result = await env.request<{ path: string; stderr?: string }>(
+      "/git/clone",
+      { url, ...(dir ? { dir } : {}) },
+      { timeoutMs: 310_000 },
+    );
+    const note = result.stderr?.trim();
+    return {
+      output: [
+        {
+          type: "text",
+          text: `Cloned ${url} to ${result.path}${note ? `\n${note}` : ""}`,
+        },
+      ],
+      details: { path: result.path },
+    };
+  },
+});
+
+const gitStatusTool = defineTool({
+  name: "git_status",
+  description:
+    "Show `git status --porcelain=v1` for a directory in /workspace. Read-only and replay-safe.",
+  parameters: Type.Object({
+    repo: Type.Optional(
+      Type.String({ description: "Workspace-relative repository path; default ." }),
+    ),
+  }),
+  replay: "safe",
+  async execute({ repo }, api) {
+    const env = boxEnv(api);
+    const result = await env.request<{ path: string; stdout: string }>(
+      "/git/status",
+      { repo: repo ?? "." },
+      { timeoutMs: 60_000 },
+    );
+    return {
+      output: [
+        {
+          type: "text",
+          text: result.stdout.trim() || `clean (${result.path})`,
+        },
+      ],
+      details: { path: result.path },
+    };
+  },
+});
+
+const workspaceSection = section("workspace", (input) => {
+  if (input.env instanceof DaemonEnv) return input.env.describe();
+  return [
+    "No box workspace is available.",
+    "Do not claim a path exists or quote file contents unless a tool confirms it.",
+  ].join("\n");
+});
+
+const codingExtension = defineExtension({
+  name: "fleet-coding",
+  tools: [readTool, writeTool, editTool, bashTool, gitCloneTool, gitStatusTool],
+  sections: [workspaceSection],
+});
+
 export class Assistant extends Agent<Env> {
   registry = createRegistry();
   private modelsRef?: MutableModels;
@@ -242,13 +476,24 @@ export class Assistant extends Agent<Env> {
         name: "fleet-base",
         tools: [echoTool],
       });
+      this.registry.install(codingExtension);
       // Best-effort: adopt the router's real context/output limits so pi
       // manages long transcripts against true capacity. Unreachable router
       // (or no key yet) keeps the conservative static defaults.
       const router = await fetchRouterLiveModels(env);
       const models = buildModels(env, liveLimitsMap(router.info));
       this.modelsRef = models;
-      return Harness.open(storage, { models, registry: this.registry }, context);
+      return Harness.open(
+        storage,
+        {
+          models,
+          registry: this.registry,
+          // The Worker cannot touch host files or spawn processes; every
+          // coding tool call goes through the loopback box daemon.
+          env: (target) => this.openBoxEnv(target),
+        },
+        context,
+      );
     },
     defaults: {
       // Resolved from env at construction time. The harness factory above
@@ -268,6 +513,13 @@ export class Assistant extends Agent<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.lifecycle.use(this.harness);
+  }
+
+  // ConversationId is only unique inside one Durable Object; every Assistant
+  // starts at "1". The workspace id therefore includes the DO id, so two
+  // agents never share a directory.
+  private workspaceId(conversationId: string): string {
+    return `${String(this.ctx.id)}-${conversationId}`;
   }
 
   async ask(
@@ -335,12 +587,206 @@ export class Assistant extends Agent<Env> {
     return entries.slice(-count).map((entry) => summarizeEntry(entry));
   }
 
-  // Fresh context for this agent (clears the transcript). The next prompt
-  // re-applies the pin/heal logic in ask(), so a reset also picks up a moved
-  // default model.
+  // Fresh context for this agent (clears the transcript and the local
+  // workspace). The next prompt re-applies the pin/heal logic in ask(), so a
+  // reset also picks up a moved default model.
   async resetSession() {
+    const conversationId = ROOT_WORKSPACE_ID;
+    const workspaceId = this.workspaceId(conversationId);
+    let workspaceDeleted = false;
+    const record = await this.workspaceRecord(conversationId);
+    if (record) {
+      try {
+        const base = executorUrl(this.env as Env);
+        let result = await daemonJson(`${base}/workspace/reset`, {
+          token: record.token,
+          workspace: workspaceId,
+          timeoutMs: 15_000,
+        });
+        if (result.status === 401) {
+          const next = await this.handshakeWorkspace(
+            conversationId,
+            workspaceId,
+            record.tier,
+            record.quotaMb,
+            record,
+          );
+          result = await daemonJson(`${base}/workspace/reset`, {
+            token: next.token,
+            workspace: next.id,
+            timeoutMs: 15_000,
+          });
+        }
+        if (result.status === 200) {
+          workspaceDeleted = true;
+          await this.ctx.storage.delete(workspaceKey(conversationId));
+          this.workspaceBindings.delete(conversationId);
+        }
+      } catch {
+        // The daemon is down. The transcript reset below is still durable; the
+        // workspace record stays so a later reset can delete the files.
+      }
+    }
     await this.harness.session().reset();
-    return true;
+    return { reset: true, workspaceDeleted };
+  }
+
+  // Tier and quota are app config, not pi.agent fields: pi.agent has no
+  // extension point for application data. They live in the same DO SQLite
+  // database under their own keys and are read again on every env build.
+  async setSandboxConfig(sandbox?: unknown, quotaMb?: unknown) {
+    const conversationId = ROOT_WORKSPACE_ID;
+    const workspaceId = this.workspaceId(conversationId);
+    const tier =
+      sandbox === undefined
+        ? await this.sandboxTier(conversationId)
+        : parseSandboxTier(sandbox);
+    const quota =
+      quotaMb === undefined
+        ? await this.sandboxQuota(conversationId)
+        : parseQuota(quotaMb);
+    await this.ctx.storage.put(tierKey(conversationId), tier);
+    await this.ctx.storage.put(quotaKey(conversationId), quota);
+    this.workspaceBindings.delete(conversationId);
+    const record = await this.workspaceRecord(conversationId);
+    if (record) {
+      try {
+        const next = await this.handshakeWorkspace(
+          conversationId,
+          workspaceId,
+          tier,
+          quota,
+          record,
+        );
+        this.workspaceBindings.set(conversationId, next);
+      } catch {
+        // Keep the old record; the next env build sees the tier/quota
+        // mismatch and re-handshakes before the first tool call.
+      }
+    }
+    return { sandbox: tier, quotaMb: quota };
+  }
+
+  private readonly workspaceBindings = new Map<string, WorkspaceBinding>();
+
+  private async openBoxEnv(target: {
+    conversationId: unknown;
+  }): Promise<DaemonEnv> {
+    const conversationId = String(target.conversationId);
+    const workspaceId = this.workspaceId(conversationId);
+    const tier = await this.sandboxTier(conversationId);
+    const quotaMb = await this.sandboxQuota(conversationId);
+    let binding = this.workspaceBindings.get(conversationId);
+    if (!binding || binding.tier !== tier || binding.quotaMb !== quotaMb) {
+      const record = await this.workspaceRecord(conversationId);
+      binding =
+        record && record.tier === tier && record.quotaMb === quotaMb
+          ? record
+          : await this.handshakeWorkspace(
+              conversationId,
+              workspaceId,
+              tier,
+              quotaMb,
+              record,
+            );
+      this.workspaceBindings.set(conversationId, binding);
+    }
+    return new DaemonEnv({
+      baseUrl: executorUrl(this.env as Env),
+      binding,
+      rehandshake: async () => {
+        const next = await this.handshakeWorkspace(
+          conversationId,
+          workspaceId,
+          tier,
+          quotaMb,
+        );
+        this.workspaceBindings.set(conversationId, next);
+        return next;
+      },
+    });
+  }
+
+  private async sandboxTier(conversationId: string): Promise<SandboxTier> {
+    const stored = await this.ctx.storage.get<string>(tierKey(conversationId));
+    return stored === "t1" ? "t1" : "t0";
+  }
+
+  private async sandboxQuota(conversationId: string): Promise<number> {
+    const stored = await this.ctx.storage.get<number>(quotaKey(conversationId));
+    return typeof stored === "number" && stored > 0 ? stored : DEFAULT_QUOTA_MB;
+  }
+
+  private async workspaceRecord(
+    conversationId: string,
+  ): Promise<WorkspaceRecord | null> {
+    const stored = await this.ctx.storage.get<WorkspaceRecord>(
+      workspaceKey(conversationId),
+    );
+    return stored && typeof stored.token === "string" ? stored : null;
+  }
+
+  private async handshakeWorkspace(
+    conversationId: string,
+    workspaceId: string,
+    tier: SandboxTier,
+    quotaMb: number,
+    previous?: WorkspaceRecord | null,
+  ): Promise<WorkspaceRecord> {
+    const base = executorUrl(this.env as Env);
+    const prior = previous ?? (await this.workspaceRecord(conversationId));
+    const { status, json } = await daemonJson(`${base}/workspace`, {
+      body: { id: workspaceId, tier, quotaMb },
+      timeoutMs: 10_000,
+    });
+    if (status !== 200 || !json) {
+      const message =
+        typeof json?.error === "object" &&
+        json.error &&
+        typeof (json.error as { message?: unknown }).message === "string"
+          ? ((json.error as { message: string }).message)
+          : `box /workspace failed with HTTP ${status}`;
+      throw new Error(message);
+    }
+    const token = typeof json.token === "string" ? json.token : "";
+    const boxId = typeof json.boxId === "string" ? json.boxId : "";
+    if (!token || !boxId) {
+      throw new Error("box /workspace returned no token or box id");
+    }
+    const lostFrom =
+      typeof json.lostFrom === "string"
+        ? json.lostFrom
+        : prior && prior.boxId !== boxId
+          ? prior.boxId
+          : prior?.lostFrom;
+    const record: WorkspaceRecord = {
+      id: workspaceId,
+      token,
+      tier,
+      quotaMb,
+      boxId,
+      ...(lostFrom ? { lostFrom } : {}),
+      createdAt:
+        typeof prior?.createdAt === "string"
+          ? prior.createdAt
+          : new Date().toISOString(),
+    };
+    await this.ctx.storage.put(workspaceKey(conversationId), record);
+    return record;
+  }
+
+  // Debug/support view of the box side: no token, just the deterministic
+  // directory id and the stored tier/quota. Used by /state and E2E scripts.
+  async workspaceState() {
+    const conversationId = ROOT_WORKSPACE_ID;
+    const record = await this.workspaceRecord(conversationId);
+    return {
+      workspace: this.workspaceId(conversationId),
+      sandbox: await this.sandboxTier(conversationId),
+      quotaMb: await this.sandboxQuota(conversationId),
+      boxId: record?.boxId ?? null,
+      lostFrom: record?.lostFrom ?? null,
+    };
   }
 
   // Which model WE last pinned this session to, in DO storage (survives
@@ -494,6 +940,11 @@ function getAssistantStub(env: Env, name: string) {
       listModels: () => Promise<unknown>;
       recentMessages: (...args: unknown[]) => Promise<unknown>;
       resetSession: () => Promise<unknown>;
+      setSandboxConfig: (
+        sandbox?: unknown,
+        quotaMb?: unknown,
+      ) => Promise<unknown>;
+      workspaceState: () => Promise<unknown>;
     };
     idFromName?: (name: string) => unknown;
     get?: (id: unknown) => {
@@ -501,6 +952,11 @@ function getAssistantStub(env: Env, name: string) {
       listModels: () => Promise<unknown>;
       recentMessages: (...args: unknown[]) => Promise<unknown>;
       resetSession: () => Promise<unknown>;
+      setSandboxConfig: (
+        sandbox?: unknown,
+        quotaMb?: unknown,
+      ) => Promise<unknown>;
+      workspaceState: () => Promise<unknown>;
     };
   };
   if (typeof binding.getByName === "function") return binding.getByName(name);
@@ -721,8 +1177,11 @@ export default {
       }
       // Best effort, deliberately coarse: the binding is addressable and
       // celld activates the cell on demand, so we report resident:true once
-      // the route itself is reachable. No per-cell residency probe yet.
-      return Response.json({ name, resident: true });
+      // the route itself is reachable. The workspace fields are read from DO
+      // storage; the token is never returned.
+      const stub = getAssistantStub(env, name);
+      const workspace = (await stub.workspaceState()) as Record<string, unknown>;
+      return Response.json({ name, resident: true, ...workspace });
     }
 
     const messagesMatch = url.pathname.match(/^\/agent\/([^/]+)\/messages$/);
@@ -740,6 +1199,40 @@ export default {
       return Response.json({ name, messages });
     }
 
+    const configMatch = url.pathname.match(/^\/agent\/([^/]+)\/config$/);
+    if (configMatch && request.method === "POST") {
+      let name: string;
+      try {
+        name = agentNameFromPath(configMatch[1]);
+      } catch (err) {
+        return badRequest(err);
+      }
+      let body: unknown;
+      try {
+        body = await request.json();
+      } catch {
+        return Response.json({ error: "invalid JSON body" }, { status: 400 });
+      }
+      const sandbox = (body as { sandbox?: unknown }).sandbox;
+      const quotaMb = (body as { quotaMb?: unknown }).quotaMb;
+      if (sandbox === undefined && quotaMb === undefined) {
+        return Response.json(
+          { error: "body needs sandbox (\"t0\"|\"t1\") or quotaMb" },
+          { status: 400 },
+        );
+      }
+      const stub = getAssistantStub(env, name);
+      try {
+        const result = (await stub.setSandboxConfig(sandbox, quotaMb)) as {
+          sandbox?: unknown;
+          quotaMb?: unknown;
+        };
+        return Response.json({ name, ...result });
+      } catch (err) {
+        return badRequest(err);
+      }
+    }
+
     const resetMatch = url.pathname.match(/^\/agent\/([^/]+)\/reset$/);
     if (resetMatch && request.method === "POST") {
       let name: string;
@@ -749,8 +1242,14 @@ export default {
         return badRequest(err);
       }
       const stub = getAssistantStub(env, name);
-      await stub.resetSession();
-      return Response.json({ name, reset: true });
+      const result = (await stub.resetSession()) as {
+        workspaceDeleted?: unknown;
+      };
+      return Response.json({
+        name,
+        reset: true,
+        workspaceDeleted: result?.workspaceDeleted === true,
+      });
     }
 
     return new Response("not found", { status: 404 });
