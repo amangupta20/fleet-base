@@ -1,9 +1,9 @@
 {
-  "name": "fleet",
+  "name": "fleet-base",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Minimal self-hosted Durable Objects fleet base — Cloudflare Worker + Durable Object agent (Pi models, SQLite resume), local-only under celld dev",
+  "description": "Self-hosted agents that outlive your laptop. One Worker, two Durable Objects, SQLite resume, local-first by default.",
   "license": "MIT",
   "repository": {
     "type": "git",

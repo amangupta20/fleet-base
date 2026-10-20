@@ -1,15 +1,63 @@
 # fleet-base
 
-Minimal, self-hosted **Durable Objects fleet** — a [Cloudflare Workers](https://workers.cloudflare.com/) app with a Durable Object agent (plus a plain name-registry DO), run locally with [`celld`](https://github.com/denoland/celld) and powered by [Pi](https://github.com/badlogic/pi-mono) models via `pi-ai` + `pi-durable`.
+**Self-hosted agents that outlive your laptop.**
 
-Use this as a **starter template** if you want to build your own self-hosted agent fleet: one Worker, two Durable Objects (an agent + a name registry), one model call with a tool loop, SQLite-checkpointed resume, and idempotent prompts. Everything else (containers, MCP, auth, UI, queues) is deliberately left out so you can see the smallest thing that works end-to-end.
+Demos: [fresh boot + health](docs/demo/fresh-boot.gif) · [kill -9 resume](docs/demo/kill-9-resume.gif) · [second terminal prompt](docs/demo/second-terminal.gif)
 
-> **Status:** local-only base. `celld dev` works. Bucket/fleet deploy files are included as documented examples but are not required to run this.
+A stateless Worker forgets the run between requests. A chat UI such as OpenWebUI
+remembers the conversation, not the in-flight run. fleet-base keeps the run in a
+SQLite-backed Durable Object: kill the process mid-prompt, restart, re-POST the
+same `requestId`, and it resumes from the checkpoint.
+
+## 30-second proof
+
+From a fresh clone (Linux, Node 22.19+, `celld` and `esbuild` on `PATH`):
+
+```sh
+git clone https://github.com/amangupta20/fleet-base.git
+cd fleet-base
+npm install
+cp .env.example .dev.vars   # add one provider, see Configuration
+npm run dev                 # http://127.0.0.1:9876
+```
+
+In a second shell:
+
+```sh
+curl -s localhost:9876/health
+# ok
+
+curl -s -X POST localhost:9876/agent/test/prompt \
+  -H 'content-type: application/json' \
+  -d '{"prompt":"Reply with exactly: fleet is alive","requestId":"req-readme-v010"}'
+# {"text":"fleet is alive","submissionId":"req-readme-v010","operationId":"req-readme-v010","status":"done","reason":null}
+```
+
+That is a real response from a local run. The output is pasted exactly. The
+`submissionId` and `operationId` are the same value: the durable handle you
+re-POST after a crash.
+
+## Tradeoffs
+
+- **No auth.** Every route is unauthenticated. Bind it to localhost or put it
+  behind your own proxy. Do not expose it to the internet.
+- **No containers, KV, D1, or queues.** One Worker and two Durable Objects. If
+  you need a sandbox, a queue, or a second storage system, this base does not
+  ship one.
+- **Local-only by default.** `celld dev` writes to `.celld/dev/`. Bucket
+  deploy files are included as documented examples, but the default path is one
+  machine and bucket deploys were not re-tested for this tag.
+
+The rest of this README assumes you want the smallest working base and will add
+your own surface. The demo GIFs are terminal recordings of this API
+([notes](docs/demo/README.md)).
 
 ---
 
 ## Table of contents
 
+- [30-second proof](#30-second-proof)
+- [Tradeoffs](#tradeoffs)
 - [How it works](#how-it-works)
 - [Prerequisites](#prerequisites)
 - [Quickstart](#quickstart)
@@ -324,7 +372,7 @@ curl 'localhost:9876/agent/test/messages?limit=10'
 
 ### `POST /agent/:name/reset`
 
-Start a fresh context for the agent (pre-reset entries leave the active transcript — useful after a run of failed prompts, or after switching providers). The next prompt re-applies the pin/heal logic, so it also picks up a moved default model.
+Start a new context for the agent. `GET /messages` returns a `pi.reset` entry, not the prior messages; the `/agents` entry (name, `lastActive`, `prompts`) is kept, and old rows may remain in storage. The next prompt re-applies the pin/heal logic, so it also picks up a moved default model.
 
 ```sh
 curl -X POST localhost:9876/agent/test/reset
