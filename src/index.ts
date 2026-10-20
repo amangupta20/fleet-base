@@ -1,4 +1,5 @@
 import { Agent } from "agents";
+import { DurableObject } from "cloudflare:workers";
 import { PiHarness } from "agents/harness/pi";
 import {
   createModels,
@@ -16,6 +17,7 @@ import { createRegistry, Harness, defineTool } from "@earendil-works/pi-durable"
 
 export interface Env {
   ASSISTANT: DurableObjectNamespace;
+  REGISTRY: DurableObjectNamespace;
   // Custom OpenAI-compatible router: your own gateway (LiteLLM, Ollama,
   // vLLM, LM Studio, ...). No OpenAI/Gemini key needed when this is set.
   ROUTER_BASE_URL?: string;
@@ -347,6 +349,65 @@ export class Assistant extends Agent<Env> {
   }
 }
 
+// Name -> activity index for the fleet, in one plain Durable Object (not an
+// Agent: this needs storage, not a model). Lives in the same fleet/bucket as
+// the assistants. Stores names + counters only, never prompt text.
+const REGISTRY_PREFIX = "agent:";
+const REGISTRY_INSTANCE = "global";
+const MAX_AGENT_NAME_LENGTH = 128;
+
+interface RegistryEntry {
+  name: string;
+  lastActive: string;
+  prompts: number;
+}
+
+interface RegistryRecord {
+  lastActive: string;
+  prompts: number;
+}
+
+function normalizeAgentName(raw: string): string {
+  const name = typeof raw === "string" ? raw.trim() : "";
+  if (!name) throw new Error("agent name must be non-empty");
+  if (name.includes("/")) throw new Error("agent name must not contain '/'");
+  if ([...name].length > MAX_AGENT_NAME_LENGTH) {
+    throw new Error(`agent name must be at most ${MAX_AGENT_NAME_LENGTH} characters`);
+  }
+  return name;
+}
+
+export class Registry extends DurableObject {
+  // Called once per prompt POST, including idempotent replays (the prompt run
+  // dedupes, the touch does not).
+  async touch(name: string): Promise<void> {
+    const key = `${REGISTRY_PREFIX}${normalizeAgentName(name)}`;
+    const prev = (await this.ctx.storage.get<RegistryRecord>(key)) ?? { prompts: 0 };
+    await this.ctx.storage.put(key, {
+      lastActive: new Date().toISOString(),
+      prompts: (prev.prompts ?? 0) + 1,
+    });
+  }
+
+  // Most recently active first; `prefix` filters decoded names.
+  async list(limit = 100, prefix?: string): Promise<RegistryEntry[]> {
+    const stored = await this.ctx.storage.list<RegistryRecord>({
+      prefix: REGISTRY_PREFIX,
+    });
+    const entries = [...stored.entries()]
+      .map(([key, value]) => ({
+        name: key.slice(REGISTRY_PREFIX.length),
+        lastActive: value?.lastActive ?? "",
+        prompts: value?.prompts ?? 0,
+      }))
+      .filter((entry) => !prefix || entry.name.startsWith(prefix));
+    entries.sort((a, b) =>
+      a.lastActive < b.lastActive ? 1 : a.lastActive > b.lastActive ? -1 : 0,
+    );
+    return entries.slice(0, limit);
+  }
+}
+
 // One JSON-safe line per transcript entry: kind + a short text preview.
 // Shapes vary (model messages, tool calls, error payloads), so this is
 // deliberately defensive — unknown shapes fall back to a JSON snippet.
@@ -416,6 +477,26 @@ function getAssistantStub(env: Env, name: string) {
     return binding.get(binding.idFromName(name));
   }
   throw new Error("ASSISTANT binding has neither getByName nor idFromName/get");
+}
+
+type RegistryStub = {
+  touch: (name: string) => Promise<unknown>;
+  list: (limit: number, prefix?: string) => Promise<RegistryEntry[]>;
+};
+
+function getRegistryStub(env: Env): RegistryStub {
+  const binding = env.REGISTRY as unknown as {
+    getByName?: (name: string) => RegistryStub;
+    idFromName?: (name: string) => unknown;
+    get?: (id: unknown) => RegistryStub;
+  };
+  if (typeof binding.getByName === "function") {
+    return binding.getByName(REGISTRY_INSTANCE);
+  }
+  if (typeof binding.idFromName === "function" && typeof binding.get === "function") {
+    return binding.get(binding.idFromName(REGISTRY_INSTANCE));
+  }
+  throw new Error("REGISTRY binding has neither getByName nor idFromName/get");
 }
 
 async function fetchRouterLiveModels(env: Env): Promise<{
@@ -514,6 +595,25 @@ export default {
       });
     }
 
+    if (request.method === "GET" && url.pathname === "/agents") {
+      const rawLimit = url.searchParams.get("limit");
+      const parsedLimit =
+        rawLimit === null || rawLimit.trim() === "" ? NaN : Number(rawLimit);
+      const limit = Number.isFinite(parsedLimit)
+        ? Math.min(Math.max(Math.floor(parsedLimit), 1), 1000)
+        : 100;
+      const prefix = url.searchParams.get("prefix") || undefined;
+      try {
+        const agents = await getRegistryStub(env).list(limit, prefix);
+        return Response.json({ agents, count: agents.length });
+      } catch (err) {
+        return Response.json(
+          { error: err instanceof Error ? err.message : String(err) },
+          { status: 500 },
+        );
+      }
+    }
+
     const promptMatch = url.pathname.match(/^\/agent\/([^/]+)\/prompt$/);
     if (promptMatch && request.method === "POST") {
       let body: unknown;
@@ -545,6 +645,12 @@ export default {
         );
       }
       const name = decodeURIComponent(promptMatch[1]);
+      // Best effort: registry bookkeeping must never fail a prompt.
+      try {
+        await getRegistryStub(env).touch(name);
+      } catch {
+        // Ignored by design.
+      }
       const stub = getAssistantStub(env, name);
       try {
         const result = await stub.ask(prompt, requestId, model);

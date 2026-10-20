@@ -1,8 +1,8 @@
 # fleet-base
 
-Minimal, self-hosted **Durable Objects fleet** — a [Cloudflare Workers](https://workers.cloudflare.com/) app with one Durable Object agent, run locally with [`celld`](https://github.com/denoland/celld) and powered by [Pi](https://github.com/badlogic/pi-mono) models via `pi-ai` + `pi-durable`.
+Minimal, self-hosted **Durable Objects fleet** — a [Cloudflare Workers](https://workers.cloudflare.com/) app with a Durable Object agent (plus a plain name-registry DO), run locally with [`celld`](https://github.com/denoland/celld) and powered by [Pi](https://github.com/badlogic/pi-mono) models via `pi-ai` + `pi-durable`.
 
-Use this as a **starter template** if you want to build your own self-hosted agent fleet: one Worker, one Durable Object, one model call with a tool loop, SQLite-checkpointed resume, and idempotent prompts. Everything else (containers, MCP, auth, UI, queues) is deliberately left out so you can see the smallest thing that works end-to-end.
+Use this as a **starter template** if you want to build your own self-hosted agent fleet: one Worker, two Durable Objects (an agent + a name registry), one model call with a tool loop, SQLite-checkpointed resume, and idempotent prompts. Everything else (containers, MCP, auth, UI, queues) is deliberately left out so you can see the smallest thing that works end-to-end.
 
 > **Status:** local-only base. `celld dev` works. Bucket/fleet deploy files are included as documented examples but are not required to run this.
 
@@ -35,6 +35,7 @@ curl POST /agent/:name/prompt
   └─> Worker `fetch()` (src/index.ts)
         ├─> GET /health → "ok"
         ├─> GET /models → catalog + live router ids + env status (no DO needed)
+        ├─> GET /agents → REGISTRY Durable Object stub (names + activity only)
         ├─> POST /agent/:name/prompt → ASSISTANT Durable Object stub
         │     └─> Assistant.ask(prompt, requestId, model?)
         │           └─> PiHarness.prompt(prompt, { operationId })
@@ -50,10 +51,11 @@ Key pieces:
 |---|---|---|
 | **Worker** | Routes HTTP to Durable Objects | `src/index.ts` default export `fetch()` |
 | **Assistant DO** | One SQLite-backed Durable Object per `:name`, via `agents` SDK `Agent` class | `src/index.ts` `export class Assistant` |
+| **Registry DO** | One plain `DurableObject` (no model) indexing agent names, last-active time, and prompt counts | `src/index.ts` `export class Registry` |
 | **PiHarness** | Lifecycle wrapper that opens a `pi-durable` `Harness` per DO (models + tool registry + storage) | `Assistant.harness` |
 | **Models** | `pi-ai` `createModels()` with four providers: own OpenAI-compatible router (`router`), OpenCode Go (`opencode-go`), OpenAI, Google — auth read from Worker env | `buildModels()` in [src/index.ts](src/index.ts) |
-| **Registry** | Tool registry; ships with a single `echo` tool | `echoTool` + `registry.install()` |
-| **Wrangler** | Minimal binding: `ASSISTANT` → `Assistant`, `v1` SQLite migration | `wrangler.jsonc` |
+| **Tool registry** | pi-durable tool registry; ships with a single `echo` tool | `echoTool` + `registry.install()` |
+| **Wrangler** | Minimal bindings: `ASSISTANT` → `Assistant`, `REGISTRY` → `Registry`; `v1`/`v2` SQLite migrations | `wrangler.jsonc` |
 | **celld** | Local runtime that emulates Workers + Durable Objects; persists to `.celld/dev/` | `npm run dev` → `celld dev` |
 
 The `:name` in `/agent/:name/prompt` is the Durable Object name (`getByName`). `POST /agent/test/prompt` and `POST /agent/alice/prompt` are different persistent agents with separate SQLite state.
@@ -210,9 +212,15 @@ The harness factory re-checks configuration at runtime so misconfiguration fails
   "compatibility_date": "2026-10-19",
   "compatibility_flags": ["nodejs_compat"],
   "durable_objects": {
-    "bindings": [{ "name": "ASSISTANT", "class_name": "Assistant" }]
+    "bindings": [
+      { "name": "ASSISTANT", "class_name": "Assistant" },
+      { "name": "REGISTRY", "class_name": "Registry" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Assistant"] }]
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Assistant"] },
+    { "tag": "v2", "new_sqlite_classes": ["Registry"] }
+  ]
 }
 ```
 
@@ -245,6 +253,17 @@ curl localhost:9876/models
 ```
 
 `router.live` is `null` when the router is unreachable — the static catalog still lists pre-registered ids.
+
+### `GET /agents`
+
+List known agent names, most recently active first. `limit` defaults to 100 and is clamped to 1–1000; `prefix` filters names that start with it.
+
+```sh
+curl 'localhost:9876/agents?limit=50&prefix=a'
+# -> {"agents":[{"name":"alice","lastActive":"2026-10-20T06:41:12.345Z","prompts":3}],"count":1}
+```
+
+The registry stores **names, timestamps, and prompt counts only — never prompt text or transcripts**. It is one plain `Registry` Durable Object in the same fleet/bucket as the agents, so every browser sees the same list instead of a per-browser `localStorage` list. Activity moves on prompt POSTs only: `/messages`, `/state`, and `/reset` do not touch it, and reset keeps the entry. Bookkeeping is best-effort — if the registry fails, the prompt still runs. A re-POST with the same `requestId` is idempotent for the run but still bumps `prompts` by one, because touch runs once per HTTP POST, not per unique submission. Storage/binding errors return `500`; this route never returns `404`.
 
 ### `POST /agent/:name/prompt`
 
@@ -374,8 +393,8 @@ Ask the model to echo something (`"use the echo tool to echo 'hello'"`). If the 
 ```
 fleet-base/
 ├── src/
-│   └── index.ts          # Worker routes + Assistant DO + echo tool + model wiring
-├── wrangler.jsonc        # Worker name, entry, DO binding, SQLite migration
+│   └── index.ts          # Worker routes + Assistant/Registry DOs + echo tool + model wiring
+├── wrangler.jsonc        # Worker name, entry, DO bindings, SQLite migrations
 ├── package.json          # npm scripts (dev → celld dev), pi/ai/durable + agents deps
 ├── .env.example          # Copy to .dev.vars; one provider key required
 ├── deploy/
@@ -421,7 +440,7 @@ Tips:
 
 ## Adding more agents / bindings
 
-- **More agents:** no code change — `POST /agent/<any-name>/prompt` creates/address a DO by name. Use one name per user, per repo, per employee, etc.
+- **More agents:** no code change — `POST /agent/<any-name>/prompt` creates/address a DO by name. Use one name per user, per repo, per employee, etc. Each name shows up in `GET /agents` after its first prompt.
 - **More bindings:** add to `wrangler.jsonc` (R2, KV, D1, queues, workflows) and extend `Env` in `src/index.ts`. Keep `wrangler.jsonc` minimal until you need them — each binding is a new failure mode.
 - **Multi-harness / MCP / containers:** intentionally absent. Add them after the echo loop + resume tests pass on your machine.
 

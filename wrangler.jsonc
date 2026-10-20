@@ -5,7 +5,13 @@
   "compatibility_date": "2026-10-19",
   "compatibility_flags": ["nodejs_compat"],
   "durable_objects": {
-    "bindings": [{ "name": "ASSISTANT", "class_name": "Assistant" }]
+    "bindings": [
+      { "name": "ASSISTANT", "class_name": "Assistant" },
+      { "name": "REGISTRY", "class_name": "Registry" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Assistant"] }]
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Assistant"] },
+    { "tag": "v2", "new_sqlite_classes": ["Registry"] }
+  ]
 }
