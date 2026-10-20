@@ -256,7 +256,7 @@ const DEFAULT_EXECUTOR_URL = "http://127.0.0.1:9877";
 const DEFAULT_QUOTA_MB = 200;
 const MAX_QUOTA_MB = 4096;
 
-type WorkspaceRecord = WorkspaceBinding & { createdAt?: string };
+type WorkspaceRecord = WorkspaceBinding;
 
 function workspaceKey(conversationId: string): string {
   return `${WORKSPACE_KEY_PREFIX}${conversationId}`;
@@ -803,27 +803,15 @@ export class Assistant extends Agent<Env> {
       quotaMb,
       boxId,
       ...(lostFrom ? { lostFrom } : {}),
-      createdAt:
-        typeof prior?.createdAt === "string"
-          ? prior.createdAt
-          : new Date().toISOString(),
     };
     await this.ctx.storage.put(workspaceKey(conversationId), record);
     return record;
   }
 
   // Debug/support view of the box side: no token, just the deterministic
-  // directory id and the stored tier/quota. Used by /state and E2E scripts.
+  // directory id. Used by /state and E2E scripts.
   async workspaceState() {
-    const conversationId = ROOT_CONVERSATION_ID;
-    const record = await this.workspaceRecord(conversationId);
-    return {
-      workspace: this.workspaceId(conversationId),
-      sandbox: await this.sandboxTier(conversationId),
-      quotaMb: await this.sandboxQuota(conversationId),
-      boxId: record?.boxId ?? null,
-      lostFrom: record?.lostFrom ?? null,
-    };
+    return { workspace: this.workspaceId(ROOT_CONVERSATION_ID) };
   }
 
   // Which model WE last pinned this session to, in DO storage (survives

@@ -86,11 +86,18 @@ const BOX_ID_FILE = resolve(
 const BWRAP = existsSync("/usr/bin/bwrap") ? "/usr/bin/bwrap" : "bwrap";
 const BWRAP_AVAILABLE = existsSync("/usr/bin/bwrap");
 const MAX_BODY_BYTES = 16 * 1024 * 1024;
-// 12 MiB fits inside the 16 MiB JSON body after base64 inflation (4/3).
-const MAX_FILE_BYTES = 12 * 1024 * 1024;
+// 11 MiB leaves headroom for base64 inflation (4/3) and the JSON envelope
+// inside the 16 MiB body cap.
+const MAX_FILE_BYTES = 11 * 1024 * 1024;
 const MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
-const EXEC_TIMEOUT_MS = positiveInt(process.env.FLEET_EXEC_TIMEOUT_MS, 120_000);
-const CLONE_TIMEOUT_MS = positiveInt(process.env.FLEET_CLONE_TIMEOUT_MS, 300_000);
+const EXEC_TIMEOUT_MS = Math.min(
+  positiveInt(process.env.FLEET_EXEC_TIMEOUT_MS, 120_000),
+  120_000,
+);
+const CLONE_TIMEOUT_MS = Math.min(
+  positiveInt(process.env.FLEET_CLONE_TIMEOUT_MS, 300_000),
+  300_000,
+);
 const DEFAULT_QUOTA_MB = 200;
 const VIRTUAL_ROOT = "/workspace";
 const MARKER = ".fleet-workspace";

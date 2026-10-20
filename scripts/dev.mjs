@@ -3,7 +3,7 @@
 // cannot spawn the box, so `npm run dev` owns both processes.
 //
 //   npm run dev                 # box on 127.0.0.1:9877 + celld dev
-//   npm run dev -- --clean      # wipe .celld/dev and .celld/workspaces first
+//   npm run dev -- --clean      # remove .celld/workspaces + box-id here; celld wipes .celld/dev
 //   npm run dev -- --port 9886  # celld flags are forwarded
 //
 // The box is a local convenience for the single-box PR1 path. It binds
@@ -36,7 +36,9 @@ try {
 if (clean) {
   rmSync(join(ROOT, ".celld", "workspaces"), { recursive: true, force: true });
   rmSync(join(ROOT, ".celld", "box-id"), { force: true });
-  console.log("[dev] --clean: removed .celld/workspaces and .celld/box-id");
+  console.log(
+    "[dev] --clean: removed .celld/workspaces and .celld/box-id (celld will wipe .celld/dev)",
+  );
 }
 
 if (!existsSync(join(ROOT, "scripts", "box.mjs"))) {

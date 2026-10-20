@@ -90,8 +90,9 @@ otherwise share a directory. The id is deterministic and exposed in
    keep working.
 6. **Size and time limits.** Exec timeout default and hard cap 120 s
    (`FLEET_EXEC_TIMEOUT_MS`); clone timeout 300 s
-   (`FLEET_CLONE_TIMEOUT_MS`); request body 16 MB; file 12 MB (the body limit
-   after base64 inflation); retained output 10 MB, byte-counted. Quota 200 MB default, checked on write and clone, overridable per
+   (`FLEET_CLONE_TIMEOUT_MS`; lower values only, the caps are 120 s and 300 s);
+   request body 16 MB; file 11 MiB (headroom for base64 in the 16 MB body);
+   retained output 10 MB, byte-counted. Quota 200 MB default, checked on write and clone, overridable per
    workspace with `POST /workspace` or `POST /agent/:name/config`.
 7. **Tier.** `t0` (default) = files + git; `t1` = files + git + bash. Stored in
    DO SQLite under `fleet:sandboxTier:v1:<conversationId>` and set with

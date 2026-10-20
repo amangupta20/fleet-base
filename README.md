@@ -106,7 +106,7 @@ curl POST /agent/:name/prompt
         │                 ├─> DaemonEnv (src/box-env.ts) ── HTTP ──> box daemon (127.0.0.1:9877)
         │                 │                                      └─> .celld/workspaces/<id>/
         │                 └─> SQLite checkpoint (resume after crash)
-        └─> GET /agent/:name/state → { name, resident, workspace, sandbox, quotaMb, boxId, lostFrom }
+        └─> GET /agent/:name/state → { name, resident, workspace }
 ```
 
 Key pieces:
@@ -400,12 +400,14 @@ Errors:
 
 ```sh
 curl localhost:9876/agent/alice/state
-# -> {"name":"alice","resident":true,
-#     "workspace":"<durable-object-id>-1",
-#     "sandbox":"t0","quotaMb":200,"boxId":null,"lostFrom":null}
+# -> {"name":"alice","resident":true,"workspace":"<durable-object-id>-1"}
 ```
 
-Best-effort and deliberately coarse: if the route is reachable, the binding is addressable and celld activates the cell on demand. The workspace fields come from DO storage and never include the token. `boxId` is `null` until the first file/tool call creates a workspace; `lostFrom` names the previous box after a migration.
+Best-effort and deliberately coarse: if the route is reachable, the binding is
+addressable and celld activates the cell on demand. It returns the deterministic
+workspace id; it never returns the token. Tier and quota are returned by
+`POST /config`. The workspace id is stable across a migration, but the files
+behind it are not; the prompt section carries the loss warning.
 
 ### `GET /agent/:name/messages`
 
@@ -633,12 +635,11 @@ because bwrap sets no-new-privileges.
 - **Clone timeout:** 300 s default (`FLEET_CLONE_TIMEOUT_MS`).
 - **Output:** 10 MB retained (byte-counted); larger output is truncated and,
   past the bash tool's spill threshold, spilling is reported.
-- **File size:** 12 MB (the 16 MB JSON body limit minus base64 inflation);
-  reads of larger files are rejected.
+- **File size:** 11 MiB (leaves headroom for base64 inflation inside the 16 MB
+  JSON body); reads of larger files are rejected.
 - **Quota:** 200 MB per workspace by default, checked on write and clone;
-  `POST /agent/:name/config {"quotaMb":50}` lowers it. `/state` shows the
-  configured quota; a write or clone that would cross it returns
-  `quota_exceeded`.
+  `POST /agent/:name/config {"quotaMb":50}` lowers it; `/config` returns the
+  stored value. A write or clone that would cross it returns `quota_exceeded`.
 - **Path jail:** every `/fs/*` path is mapped to the workspace with
   `path.resolve(workspace, target)`, rejected unless it is the workspace or
   starts with `workspace + path.sep`, checked component by component with
@@ -692,7 +693,9 @@ The box is a local trust boundary, not a multi-tenant hard boundary.
 - **Git gates.** Only `https://`; no credentials in the URL; private, loopback,
   link-local, and `.local` hosts are rejected; DNS is resolved and checked for
   private addresses; `GIT_ALLOW_PROTOCOL=https` blocks `file://`/`ext::`;
-  `--` precedes the URL.
+  `--` precedes the URL. DNS is resolved and checked; git re-resolves at
+  connect time, so a deliberate rebinding race is outside this local trust
+  boundary.
 - **Reset kills first.** `POST /reset` asks the daemon to kill running commands
   for that workspace, then deletes the directory and token entry. The
   transcript reset is separate and durable.

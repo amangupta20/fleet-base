@@ -302,7 +302,7 @@ Through the Worker:
 curl -s -X POST localhost:9886/agent/e2e-reset-1/reset
 # {"name":"e2e-reset-1","reset":true,"workspaceDeleted":true}
 curl -s localhost:9886/agent/e2e-reset-1/state
-# {"name":"e2e-reset-1","resident":true,"workspace":"8f44...-1","sandbox":"t1","quotaMb":200,"boxId":null,"lostFrom":null}
+# {"name":"e2e-reset-1","resident":true,"workspace":"8f44...-1"}
 curl -s -X POST localhost:9886/agent/e2e-reset-1/reset
 # {"name":"e2e-reset-1","reset":true,"workspaceDeleted":false}
 ```
@@ -332,10 +332,13 @@ curl -s -X POST localhost:9886/agent/e2e-t1-1/prompt \
 }
 ```
 
-`GET /state` after the handshake:
+The migration evidence is the answer above plus the parked directory:
 
-```json
-{"name":"e2e-t1-1","resident":true,"workspace":"165f...-1","sandbox":"t1","quotaMb":200,"boxId":"box-migrated-2","lostFrom":"box-e1fb292c-1add-4888-8109-8483b7739358"}
+```text
+$ ls .celld/workspaces
+...-1
+...-1.lost-...
+index.json
 ```
 
 This is the honest-loss behavior required by the single-box constraint. PR2
