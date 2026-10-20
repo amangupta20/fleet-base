@@ -248,7 +248,7 @@ const echoTool = defineTool({
 
 // ---- working files -------------------------------------------------------
 
-const ROOT_WORKSPACE_ID = "1";
+const ROOT_CONVERSATION_ID = "1";
 const WORKSPACE_KEY_PREFIX = "fleet:workspace:v1:";
 const SANDBOX_TIER_KEY_PREFIX = "fleet:sandboxTier:v1:";
 const SANDBOX_QUOTA_KEY_PREFIX = "fleet:sandboxQuota:v1:";
@@ -591,7 +591,7 @@ export class Assistant extends Agent<Env> {
   // workspace). The next prompt re-applies the pin/heal logic in ask(), so a
   // reset also picks up a moved default model.
   async resetSession() {
-    const conversationId = ROOT_WORKSPACE_ID;
+    const conversationId = ROOT_CONVERSATION_ID;
     const workspaceId = this.workspaceId(conversationId);
     let workspaceDeleted = false;
     const record = await this.workspaceRecord(conversationId);
@@ -603,7 +603,7 @@ export class Assistant extends Agent<Env> {
           workspace: workspaceId,
           timeoutMs: 15_000,
         });
-        if (result.status === 401) {
+        if (result.status === 401 || result.status === 409) {
           const next = await this.handshakeWorkspace(
             conversationId,
             workspaceId,
@@ -635,7 +635,7 @@ export class Assistant extends Agent<Env> {
   // extension point for application data. They live in the same DO SQLite
   // database under their own keys and are read again on every env build.
   async setSandboxConfig(sandbox?: unknown, quotaMb?: unknown) {
-    const conversationId = ROOT_WORKSPACE_ID;
+    const conversationId = ROOT_CONVERSATION_ID;
     const workspaceId = this.workspaceId(conversationId);
     const tier =
       sandbox === undefined
@@ -676,21 +676,34 @@ export class Assistant extends Agent<Env> {
     const workspaceId = this.workspaceId(conversationId);
     const tier = await this.sandboxTier(conversationId);
     const quotaMb = await this.sandboxQuota(conversationId);
-    let binding = this.workspaceBindings.get(conversationId);
-    if (!binding || binding.tier !== tier || binding.quotaMb !== quotaMb) {
-      const record = await this.workspaceRecord(conversationId);
+    const record = await this.workspaceRecord(conversationId);
+    const cached = this.workspaceBindings.get(conversationId) ?? record;
+    let binding: WorkspaceBinding;
+    if (cached && cached.tier === tier && cached.quotaMb === quotaMb) {
+      // A cached token or DO record can outlive a box migration. /health is
+      // cheap and unauthenticated; if the box id moved, handshake before the
+      // system prompt is rendered so <workspace> already carries lostFrom.
+      const live = await this.liveBoxId();
       binding =
-        record && record.tier === tier && record.quotaMb === quotaMb
-          ? record
+        live === cached.boxId
+          ? cached
           : await this.handshakeWorkspace(
               conversationId,
               workspaceId,
               tier,
               quotaMb,
-              record,
+              cached,
             );
-      this.workspaceBindings.set(conversationId, binding);
+    } else {
+      binding = await this.handshakeWorkspace(
+        conversationId,
+        workspaceId,
+        tier,
+        quotaMb,
+        record,
+      );
     }
+    this.workspaceBindings.set(conversationId, binding);
     return new DaemonEnv({
       baseUrl: executorUrl(this.env as Env),
       binding,
@@ -705,6 +718,30 @@ export class Assistant extends Agent<Env> {
         return next;
       },
     });
+  }
+
+  private async liveBoxId(): Promise<string> {
+    const base = executorUrl(this.env as Env);
+    let response: Response;
+    try {
+      response = await fetch(`${base}/health`, {
+        signal: AbortSignal.timeout(2_000),
+      });
+    } catch (error) {
+      throw new Error(
+        `box executor is unreachable at ${base}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    if (!response.ok) {
+      throw new Error(`box executor /health returned HTTP ${response.status}`);
+    }
+    const body = (await response.json()) as { boxId?: unknown };
+    if (typeof body.boxId !== "string" || !body.boxId) {
+      throw new Error("box executor /health returned no box id");
+    }
+    return body.boxId;
   }
 
   private async sandboxTier(conversationId: string): Promise<SandboxTier> {
@@ -778,7 +815,7 @@ export class Assistant extends Agent<Env> {
   // Debug/support view of the box side: no token, just the deterministic
   // directory id and the stored tier/quota. Used by /state and E2E scripts.
   async workspaceState() {
-    const conversationId = ROOT_WORKSPACE_ID;
+    const conversationId = ROOT_CONVERSATION_ID;
     const record = await this.workspaceRecord(conversationId);
     return {
       workspace: this.workspaceId(conversationId),

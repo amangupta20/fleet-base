@@ -86,7 +86,8 @@ const BOX_ID_FILE = resolve(
 const BWRAP = existsSync("/usr/bin/bwrap") ? "/usr/bin/bwrap" : "bwrap";
 const BWRAP_AVAILABLE = existsSync("/usr/bin/bwrap");
 const MAX_BODY_BYTES = 16 * 1024 * 1024;
-const MAX_FILE_BYTES = 16 * 1024 * 1024;
+// 12 MiB fits inside the 16 MiB JSON body after base64 inflation (4/3).
+const MAX_FILE_BYTES = 12 * 1024 * 1024;
 const MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
 const EXEC_TIMEOUT_MS = positiveInt(process.env.FLEET_EXEC_TIMEOUT_MS, 120_000);
 const CLONE_TIMEOUT_MS = positiveInt(process.env.FLEET_CLONE_TIMEOUT_MS, 300_000);
@@ -294,7 +295,11 @@ function authenticate(req, id) {
   if (!tokensEqual(entry.tokenHash, bearer(req))) {
     fail(401, "unauthorized", "missing or invalid workspace token");
   }
-  workspaceDir(id);
+  const dir = workspaceDir(id);
+  const marker = readMarker(dir);
+  if (marker?.boxId && marker.boxId !== BOX_ID) {
+    fail(409, "box_mismatch", "workspace belongs to another box");
+  }
   return { entry };
 }
 
@@ -334,11 +339,6 @@ function issueWorkspace(body) {
   }
   const index = readIndex();
   const previous = index.workspaces[id];
-  if (previous?.tier === "t1" && tier === "t0") {
-    for (const [pid, value] of activeExecs) {
-      if (value.id === id) killTree(pid);
-    }
-  }
   let lostFrom;
   let created = !existsSync(dir);
 
@@ -568,7 +568,14 @@ function fsWrite(id, entry) {
     if (bytes.length > MAX_FILE_BYTES) {
       fail(413, "file_too_large", `write exceeds ${MAX_FILE_BYTES} bytes`);
     }
-    checkQuota(dir, entry, bytes.length);
+    let existing = 0;
+    try {
+      const info = statSync(target);
+      if (info.isFile()) existing = info.size;
+    } catch {
+      // New file.
+    }
+    checkQuota(dir, entry, Math.max(0, bytes.length - existing));
     const written = writeBytes(dir, target, bytes);
     return { path: virtualFor(dir, written), bytes: bytes.length };
   };
@@ -713,14 +720,26 @@ function runInBox(argv, options) {
     }
     const append = (current, chunk) => {
       const text = chunk.toString("utf8");
+      const chunkBytes = Buffer.byteLength(text, "utf8");
       if (bytes >= MAX_OUTPUT_BYTES) {
         truncated = true;
         return current;
       }
-      const remaining = MAX_OUTPUT_BYTES - bytes;
-      const accepted = text.slice(0, remaining);
-      bytes += accepted.length;
-      if (accepted.length < text.length) truncated = true;
+      if (bytes + chunkBytes <= MAX_OUTPUT_BYTES) {
+        bytes += chunkBytes;
+        return current + text;
+      }
+      const room = MAX_OUTPUT_BYTES - bytes;
+      let low = 0;
+      let high = text.length;
+      while (low < high) {
+        const mid = Math.ceil((low + high) / 2);
+        if (Buffer.byteLength(text.slice(0, mid), "utf8") <= room) low = mid;
+        else high = mid - 1;
+      }
+      const accepted = text.slice(0, low);
+      bytes += Buffer.byteLength(accepted, "utf8");
+      truncated = true;
       return current + accepted;
     };
     const effectiveTimeout = Math.max(
@@ -778,12 +797,6 @@ function runInBox(argv, options) {
   });
 }
 
-function networkCommand(cmd) {
-  return /\b(git\s+(?:clone|fetch|pull|push)|npm\s+(?:install|ci|i|update)|pnpm\s+(?:install|i|add)|yarn\s+(?:install|add)|bun\s+(?:install|add)|pip3?\s+install|curl|wget)\b/.test(
-    cmd,
-  );
-}
-
 async function execCommand(id, entry, body) {
   const dir = workspaceDir(id);
   if (entry.tier !== "t1") {
@@ -805,8 +818,7 @@ async function execCommand(id, entry, body) {
     Number.isFinite(requested) && requested > 0
       ? Math.min(requested, EXEC_TIMEOUT_MS)
       : EXEC_TIMEOUT_MS;
-  const net =
-    body.net === true || (body.net !== false && networkCommand(body.cmd));
+  const net = body.net === true;
   const spill =
     body.spill &&
     typeof body.spill.afterBytes === "number" &&
@@ -836,8 +848,7 @@ function isPrivateAddress(address) {
   const value = address.replace(/^\[|\]$/g, "").toLowerCase();
   // IPv4-mapped IPv6 can encode loopback/private in a form isIPv4() does not
   // see; reject the whole mapped range rather than parse it.
-  if (value.startsWith("::ffff:")) return true;
-  if (value === "::" || value === "::1") return true;
+  if (value.startsWith("::")) return true;
   if (value.startsWith("fe80:") || value.startsWith("fc") || value.startsWith("fd")) {
     return true;
   }

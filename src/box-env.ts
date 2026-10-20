@@ -316,17 +316,23 @@ export class DaemonEnv implements ExecutionEnv {
     };
 
     let { response, payload } = await call(this.binding.token);
-    if (response.status === 401 && !options?.retried) {
+    const error = (payload as { error?: { code?: unknown; message?: unknown } })?.error;
+    const errorCode = typeof error?.code === "string" ? error.code : "http_error";
+    if (
+      !options?.retried &&
+      (response.status === 401 ||
+        (response.status === 409 && errorCode === "box_mismatch"))
+    ) {
       this.binding = await this.rehandshake();
       ({ response, payload } = await call(this.binding.token));
     }
     if (!response.ok) {
-      const error = (payload as { error?: { code?: unknown; message?: unknown } })?.error;
+      const retryError = (payload as { error?: { code?: unknown; message?: unknown } })?.error;
       throw new DaemonRequestError(
         response.status,
-        typeof error?.code === "string" ? error.code : "http_error",
-        typeof error?.message === "string"
-          ? error.message
+        typeof retryError?.code === "string" ? retryError.code : "http_error",
+        typeof retryError?.message === "string"
+          ? retryError.message
           : `box executor returned HTTP ${response.status}`,
       );
     }

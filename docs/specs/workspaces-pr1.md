@@ -47,7 +47,10 @@ otherwise share a directory. The id is deterministic and exposed in
    creates the directory on demand, writes a `.fleet-workspace` marker, and
    persists only a SHA-256 token hash in `.celld/workspaces/index.json`. The
    Worker stores the plaintext token in DO SQLite. On a 401 the Worker
-   re-handshakes once and retries.
+   re-handshakes once and retries. The Worker also checks `GET /health` before
+   reusing a cached binding; a box-id mismatch triggers the handshake before the
+   system prompt is rendered. A stale token with a valid index gets a 409
+   `box_mismatch` from the daemon and the same one-retry path.
 2. **Routes.**
    - `POST /workspace` — enroll/rotate, no auth (loopback admin surface).
    - `POST /workspace/reset` — auth.
@@ -78,14 +81,17 @@ otherwise share a directory. The id is deterministic and exposed in
    `--unshare-all`, `--die-with-parent`, `--new-session`, `--as-pid-1`,
    `--clearenv`, `--setenv PATH /usr/bin:/bin`, `--setenv HOME /workspace`,
    `--setenv LANG C.UTF-8`, `--chdir /workspace`, `-- /usr/bin/bash -lc CMD`.
-   Net commands add `--share-net` plus read-only binds of `resolv.conf`,
-   `hosts`, `nsswitch.conf`, `ssl`, and `ca-certificates`. No host `/home`,
-   no host `/etc` otherwise. `sudo` fails via no-new-privileges. `bwrap` absent
-   is loud and only disables `/exec` and `/git/*`; t0 fs routes keep working.
+   Only `/exec` with `net:true` adds `--share-net` plus read-only binds of
+   `resolv.conf`, `hosts`, `nsswitch.conf`, `ssl`, and `ca-certificates`.
+   The `bash` tool never sets `net`, so agent bash is offline; `git_clone`
+   uses `/git/clone` with network on for its validated public URL. No host
+   `/home`, no host `/etc` otherwise. `sudo` fails via no-new-privileges.
+   `bwrap` absent is loud and only disables `/exec` and `/git/*`; t0 fs routes
+   keep working.
 6. **Size and time limits.** Exec timeout default and hard cap 120 s
    (`FLEET_EXEC_TIMEOUT_MS`); clone timeout 300 s
-   (`FLEET_CLONE_TIMEOUT_MS`); request body 16 MB; file 16 MB; retained output
-   10 MB. Quota 200 MB default, checked on write and clone, overridable per
+   (`FLEET_CLONE_TIMEOUT_MS`); request body 16 MB; file 12 MB (the body limit
+   after base64 inflation); retained output 10 MB, byte-counted. Quota 200 MB default, checked on write and clone, overridable per
    workspace with `POST /workspace` or `POST /agent/:name/config`.
 7. **Tier.** `t0` (default) = files + git; `t1` = files + git + bash. Stored in
    DO SQLite under `fleet:sandboxTier:v1:<conversationId>` and set with

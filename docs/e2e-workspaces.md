@@ -121,38 +121,63 @@ console.log("hello from the box");
 
 ## 4. t1: clone a tiny repo, run its tests, fix, rerun (agent)
 
+The final run uses `git_clone` for the network step; the `bash` tool is offline
+by design, so it only runs local commands.
+
 ```sh
-curl -s -X POST localhost:9886/agent/e2e-t1-1/prompt \
+curl -s -X POST localhost:9886/agent/e2e-final-2/prompt \
   -H 'content-type: application/json' \
-  -d '{"prompt":"Clone https://github.com/thesved/fixture-orders-api.git into the workspace (the git_clone tool is available, or use bash). Run its tests with npm test. If any test fails, read the code, fix it, and rerun the tests until they pass. Show the final test output.","requestId":"e2e-t1-1-req2"}'
+  -d '{"prompt":"Use the git_clone tool to clone https://github.com/thesved/fixture-orders-api.git. Then use bash only for local commands: run npm test in that repo, fix the failing loop, and rerun until all tests pass. Do not use bash to clone or fetch anything; bash is offline. Show the final test output.","requestId":"final-2-clone"}'
 ```
 
 Final answer:
 
 ```text
-Cloned `https://github.com/thesved/fixture-orders-api.git` to `/workspace/fixture-orders-api` and ran `npm test`.
+Cloned `https://github.com/thesved/fixture-orders-api.git` via `git_clone`, then fixed the failing loop in `src/orders.js` (`i = 1` → `i = 0`) and reran `npm test`.
 
-**Initial failures (2/3 failed):**
-- `single item total (no tax)`: `0 !== 20`
-- `multi-item total with tax`: `11 !== 22`
-
-**Bug found** in `src/orders.js`:
+Fix:
+// before:
 for (let i = 1; i < items.length; i++) {
-Loop started at index 1, skipping the first item. Fixed to:
+// after:
 for (let i = 0; i < items.length; i++) {
+The loop was skipping the first item.
 
-**Final test output (`npm test`) — all pass:**
+Final test output (`npm test` in `/workspace/fixture-orders-api`):
 npm notice run fixture-orders-api@1.0.0 test
 npm notice run node --test
-✔ single item total (no tax) (0.552016ms)
-✔ multi-item total with tax (0.10447ms)
-✔ empty order totals zero (0.078695ms)
+✔ single item total (no tax) (0.649139ms)
+✔ multi-item total with tax (0.178141ms)
+✔ empty order totals zero (0.155041ms)
 ℹ tests 3
+ℹ suites 0
 ℹ pass 3
 ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 61.102414
+All 3 tests pass.
 ```
 
-This is a real clone over HTTPS and a real `node --test` process under bwrap.
+Transcript:
+
+```text
+pi.assistant | Cloning the repo, then hunting the failing loop. / tool:git_clone
+pi.tool-result | Cloned https://github.com/thesved/fixture-orders-api.git to /workspace/fixture-orders-api ...
+pi.assistant | Cloned — now inspecting the repo and running tests. / tool:bash
+pi.tool-result | /workspace / ... (ls)
+pi.assistant | Clone confirmed — diagnosing the test failure. / tool:bash
+pi.tool-result | npm notice run fixture-orders-api@1.0.0 test / ✖ single item ... ✖ multi-item ...
+pi.assistant | Found the off-by-one — running tests to confirm before patching. / tool:bash
+pi.tool-result | ✖ single item total (no tax) ... / ✖ multi-item total with tax ...
+pi.assistant | Test confirms the first item is skipped — applying the fix. / tool:edit
+pi.tool-result | Successfully replaced 1 block(s) in /workspace/fixture-orders-api/src/orders.js.
+pi.assistant | Patch applied — rerunning tests to confirm green. / tool:bash
+pi.tool-result | ✔ single item total (no tax) / ✔ multi-item total with tax / ✔ empty order totals zero
+```
+
+This is a real HTTPS clone through the box's `/git/clone` route and a real
+`node --test` process under bwrap. Bash made no network request.
 
 ## 5. t0 `bash` returns shell_unavailable
 
@@ -247,6 +272,19 @@ exit 0
 cleared allowlist plus bash's own `PWD`, `SHLVL`, and `_`. No `FLEET`, `AWS`,
 `S3`, `CELLD`, `KEY`, or `TOKEN` value is reachable. Network is unshared, so
 `/proc/net/route` has only the header.
+
+## 6b. Network is opt-in
+
+`/exec` defaults to `net:false`; the bash tool never sets it. Direct proof with
+the same handler:
+
+```text
+net=false  exit 6  net_used false  curl: (6) Could not resolve host: github.com
+net=true   exit 0  net_used true   stdout "200"
+```
+
+`git_clone` uses the separate `/git/clone` route with network on for its
+validated public URL. Agent bash cannot exfiltrate through curl/wget by default.
 
 ## 7. Reset kills execs and deletes the workspace
 
@@ -381,8 +419,8 @@ hello from the final box
 t1, clone, test, fix, rerun:
 
 ```text
-Cloned `https://github.com/thesved/fixture-orders-api.git` to `/workspace/fixture-orders-api`,
-ran `npm test`, fixed the bug, and reran to green.
+Cloned via `git_clone`, ran `npm test` with offline bash, fixed the bug, and
+reran to green.
 
 Bug: in `src/orders.js` the loop was `for (let i = 1; ...)` skipping the first
 item. Fixed to `for (let i = 0; ...)`.

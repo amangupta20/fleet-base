@@ -106,7 +106,7 @@ curl POST /agent/:name/prompt
         │                 ├─> DaemonEnv (src/box-env.ts) ── HTTP ──> box daemon (127.0.0.1:9877)
         │                 │                                      └─> .celld/workspaces/<id>/
         │                 └─> SQLite checkpoint (resume after crash)
-        └─> GET /agent/:name/state → { name, resident, workspace, sandbox, boxId }
+        └─> GET /agent/:name/state → { name, resident, workspace, sandbox, quotaMb, boxId, lostFrom }
 ```
 
 Key pieces:
@@ -576,12 +576,12 @@ Two paths work:
 
 1. **Paste it into the prompt.** The model calls `write` (and `edit`) to create
    files. This works in t0 and t1.
-2. **`git clone`.** In t1, `bash` can run `git clone https://…` inside the
-   workspace. In t0, use the `git_clone` tool (or `POST /git/clone` on the box);
-   it also works in t1. Local paths, `file://`, `ext::`, plain `http://`, private
-   addresses, and loopback are rejected. `git_clone` is `--depth 1`,
-   `GIT_ALLOW_PROTOCOL=https`, `GIT_TERMINAL_PROMPT=0`, and has `--` before the
-   URL.
+2. **`git clone`.** Use the `git_clone` tool in t0 or t1 (or
+   `POST /git/clone` on the box). Bash is offline, so it cannot reach the
+   network; `git_clone` runs its fixed `https://` clone with network on. Local
+   paths, `file://`, `ext::`, plain `http://`, private addresses, and loopback
+   are rejected. `git_clone` is `--depth 1`, `GIT_ALLOW_PROTOCOL=https`,
+   `GIT_TERMINAL_PROMPT=0`, and has `--` before the URL.
 
 Both are documented in the [E2E proofs](docs/e2e-workspaces.md).
 
@@ -617,9 +617,11 @@ bwrap --ro-bind /usr /usr \
   -- /usr/bin/bash -lc "$COMMAND"
 ```
 
-For a network command (`git clone`, `npm install`, `curl`, …) it adds
-`--share-net` and read-only binds for `resolv.conf`, `hosts`, `nsswitch.conf`,
-`ssl`, and `ca-certificates`; otherwise the network namespace is unshared. The
+Only an `/exec` call with `net:true` adds `--share-net` and read-only binds for
+`resolv.conf`, `hosts`, `nsswitch.conf`, `ssl`, and `ca-certificates`; otherwise
+the network namespace is unshared. The `bash` tool never sets `net`, so agent
+bash is offline; `git_clone` uses the separate `/git/clone` route with network
+on for its validated public URL. The
 `--as-pid-1` keeps bwrap's own argv (including the host workspace path) out of
 `/proc/1/cmdline`; `/proc/1/environ` shows only the cleared env. `/etc/shadow`,
 `/home`, `~/.ssh`, and host absolute paths do not exist inside. `sudo` fails
@@ -629,8 +631,10 @@ because bwrap sets no-new-privileges.
 
 - **Command timeout:** 120 s default/hard cap (`FLEET_EXEC_TIMEOUT_MS`).
 - **Clone timeout:** 300 s default (`FLEET_CLONE_TIMEOUT_MS`).
-- **Output:** 10 MB retained; larger output is truncated and, past the bash
-  tool's spill threshold, spilling is reported.
+- **Output:** 10 MB retained (byte-counted); larger output is truncated and,
+  past the bash tool's spill threshold, spilling is reported.
+- **File size:** 12 MB (the 16 MB JSON body limit minus base64 inflation);
+  reads of larger files are rejected.
 - **Quota:** 200 MB per workspace by default, checked on write and clone;
   `POST /agent/:name/config {"quotaMb":50}` lowers it. `/state` shows the
   configured quota; a write or clone that would cross it returns
