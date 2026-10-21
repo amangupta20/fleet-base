@@ -4,8 +4,6 @@
 
 Local `celld dev` needs no bucket. For a real fleet node you need an S3-compatible bucket (e.g. Cloudflare R2) and the files in [deploy/](../deploy/). Verified: deploy → single bucket-backed node → `/health`, `/models`, and a `done` tool-loop prompt.
 
-For OVH Object Storage the same path applies: put `CELLD_BUCKET`, `S3_ENDPOINT`, and `AWS_*` in `.dev.vars`; the deploy helper injects only the provider vars.
-
 **Vars and secrets without hoop-jumping:** `celld deploy` ignores `.dev.vars`/`.env` — Worker variables ship via wrangler `[vars]`, baked into the deployment, and celld has no secrets mechanism. So `npm run deploy` (→ [scripts/deploy.mjs](../scripts/deploy.mjs)) does it for you: it reads provider vars from `.dev.vars` (allowlist: `ROUTER_*`, `OPENCODE_*`, `OPENAI_*`, `GEMINI_*` — bucket/CLI creds stay in your shell), merges them into a throwaway gitignored `wrangler.deploy.jsonc`, deploys, and deletes it. Extra args forward to `celld deploy`. Secrets land in the deployment objects inside your own bucket — never in git.
 
 ```sh
@@ -40,18 +38,9 @@ settles writes disk-to-disk instead of waiting for the bucket.
 
 ## Multi-node / Tailscale
 
-The systemd unit ships a commented Tailscale overlay example. Peer traffic has
-no TLS: the `/peer/tunnel` establishment carries the fleet HMAC with
-clock/replay protection, but calls inside the tunnel are plain unsigned HTTP,
-and most operator routes have no request auth. Never expose the internal
-listener to the public internet.
-
-```ini
-# Multi-node example (Tailscale overlay). Peer traffic has NO TLS: the
-# /peer/tunnel establishment carries the fleet HMAC with clock/replay
-# protection, but calls inside the tunnel are plain unsigned HTTP, and most
-# operator routes have no request auth at all (see docs/security.md). Never
-# expose the internal listener to the public internet — keep it on a trusted
-# private network / encrypted overlay.
-ExecStart=/usr/local/bin/celld --bucket ${CELLD_BUCKET} --endpoint ${S3_ENDPOINT} --region ${AWS_REGION} --listen 0.0.0.0:8080 --internal-listen 100.64.0.12:8081 --advertise 100.64.0.12:8081
-```
+The systemd unit ships a commented Tailscale overlay example: put the internal
+listener and advertise address on the node's Tailscale IP (for example
+`100.64.0.12:8081`), keep `8080` on the public listener, and never expose the
+internal listener to the internet. Peer traffic has no TLS; keep it on a trusted
+private network or encrypted overlay. See
+[deploy/fleet.service](../deploy/fleet.service).
