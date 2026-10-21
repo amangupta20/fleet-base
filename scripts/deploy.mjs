@@ -36,6 +36,7 @@ const GENERATED_CONFIG = "wrangler.deploy.jsonc";
 // Provider Worker vars only. Everything else (AWS_*, CELLD_*, S3_*, PORT, …)
 // stays in the shell.
 const WORKER_VAR_NAMES = [
+  "FLEET_EXECUTOR_URL",
   "ROUTER_BASE_URL",
   "ROUTER_API_KEY",
   "ROUTER_MODEL",

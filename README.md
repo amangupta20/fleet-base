@@ -41,12 +41,22 @@ re-POST after a crash.
 
 - **No auth.** Every route is unauthenticated. Bind it to localhost or put it
   behind your own proxy. Do not expose it to the internet.
-- **No containers, KV, D1, or queues.** One Worker and two Durable Objects. If
-  you need a sandbox, a queue, or a second storage system, this base does not
-  ship one.
-- **Local-only by default.** `celld dev` writes to `.celld/dev/`. Bucket
-  deploy files are included as documented examples, but the default path is one
-  machine and bucket deploys were not re-tested for this tag.
+- **One Worker, two Durable Objects, one box helper.** No containers, KV, D1,
+  queues, or second storage system. `npm run dev` also starts a loopback box
+  executor (`scripts/box.mjs`) because celld's V8 isolate cannot write host
+  files or spawn processes. It is a local helper, not a container platform.
+- **Files are scratch, transcripts are durable.** The transcript lives in the
+  agent's SQLite Durable Object. Files live in `.celld/workspaces/<id>/` on the
+  box. Move the agent to another box and its files are gone until PR2 adds a
+  snapshot and a pointer; the agent is told to say so, not to invent contents.
+- **Tier t0 is file-only; tier t1 adds bash.** t0 supports read/write/edit,
+  `git_clone`, and `git_status`. t1 runs commands under `bwrap` on Linux.
+  Without `bwrap`, the fs routes still work; git and exec fail closed with
+  `shell_unavailable` (git runs a process, so it is not run unsandboxed).
+- **Local-only by default.** `celld dev` writes to `.celld/dev/`; workspaces
+  are under `.celld/workspaces/`. The box binds `127.0.0.1` and uses one random
+  token per workspace. There is still no auth on the Worker itself; keep it on
+  loopback or put it behind your own proxy.
 
 The rest of this README assumes you want the smallest working base and will add
 your own surface. The demo GIFs are terminal recordings of this API
@@ -65,6 +75,10 @@ your own surface. The demo GIFs are terminal recordings of this API
 - [API reference](#api-reference)
 - [Idempotency and crash resume](#idempotency-and-crash-resume)
 - [Tools — the proof-of-loop](#tools--the-proof-of-loop)
+- [Working files — the box executor](#working-files--the-box-executor)
+- [Tiers, quotas, and config](#tiers-quotas-and-config)
+- [Security and the jail](#security-and-the-jail)
+- [Durable vs scratch](#durable-vs-scratch)
 - [Project structure](#project-structure)
 - [Adding your own tool](#adding-your-own-tool)
 - [Adding more agents / bindings](#adding-more-agents--bindings)
@@ -88,9 +102,11 @@ curl POST /agent/:name/prompt
         │     └─> Assistant.ask(prompt, requestId, model?)
         │           └─> PiHarness.prompt(prompt, { operationId })
         │                 ├─> pi-ai models (own router, opencode-go, OpenAI, Gemini)
-        │                 ├─> pi-durable registry (tools, e.g. `echo`)
+        │                 ├─> pi-durable registry (echo + read/write/edit/bash + git)
+        │                 ├─> DaemonEnv (src/box-env.ts) ── HTTP ──> box daemon (127.0.0.1:9877)
+        │                 │                                      └─> .celld/workspaces/<id>/
         │                 └─> SQLite checkpoint (resume after crash)
-        └─> GET /agent/:name/state → { name, resident: true }
+        └─> GET /agent/:name/state → { name, resident, workspace }
 ```
 
 Key pieces:
@@ -102,9 +118,12 @@ Key pieces:
 | **Registry DO** | One plain `DurableObject` (no model) indexing agent names, last-active time, and prompt counts | `src/index.ts` `export class Registry` |
 | **PiHarness** | Lifecycle wrapper that opens a `pi-durable` `Harness` per DO (models + tool registry + storage) | `Assistant.harness` |
 | **Models** | `pi-ai` `createModels()` with four providers: own OpenAI-compatible router (`router`), OpenCode Go (`opencode-go`), OpenAI, Google — auth read from Worker env | `buildModels()` in [src/index.ts](src/index.ts) |
-| **Tool registry** | pi-durable tool registry; ships with a single `echo` tool | `echoTool` + `registry.install()` |
+| **Tool registry** | `echo` plus the coding bundle: `read`, `write`, `edit`, `bash`, `git_clone`, `git_status` | `echoTool`, `codingExtension` |
+| **Box executor** | Loopback Node daemon that owns per-conversation workspaces, checks paths, and runs t1 commands under `bwrap` | `scripts/box.mjs` |
+| **DaemonEnv** | pi-durable `ExecutionEnv` implemented as authenticated HTTP calls to the box | `src/box-env.ts` |
+| **Dev supervisor** | Starts the box and `celld dev` together, forwards SIGINT, stops both | `scripts/dev.mjs` |
 | **Wrangler** | Minimal bindings: `ASSISTANT` → `Assistant`, `REGISTRY` → `Registry`; `v1`/`v2` SQLite migrations | `wrangler.jsonc` |
-| **celld** | Local runtime that emulates Workers + Durable Objects; persists to `.celld/dev/` | `npm run dev` → `celld dev` |
+| **celld** | Local runtime that emulates Workers + Durable Objects; persists to `.celld/dev/` | `npm run dev` → `scripts/dev.mjs` |
 
 The `:name` in `/agent/:name/prompt` is the Durable Object name (`getByName`). `POST /agent/test/prompt` and `POST /agent/alice/prompt` are different persistent agents with separate SQLite state.
 
@@ -116,6 +135,7 @@ The `:name` in `/agent/:name/prompt` is the Durable Object name (`getByName`). `
 - **Node.js 22.19+** — check with `node --version` (this repo tested on Node 26)
 - **celld** binary on `PATH` — local Workers + DO runtime ([denoland/celld](https://github.com/denoland/celld))
 - **esbuild** on `PATH` (or `CELLD_ESBUILD` pointing at it) — `celld dev` and `celld deploy` use it to bundle `src/index.ts`
+- **bwrap** (`bubblewrap`) at `/usr/bin/bwrap` for tier t1 commands. t0 file and git routes work without it; t1 reports `shell_unavailable`.
 - **A model provider — one of:** your own OpenAI-compatible router (Ollama, LiteLLM, vLLM, LM Studio, own gateway — keyless OK), OpenCode Go (`OPENCODE_API_KEY`), OpenAI, or Gemini
 
 Install Node dependencies:
@@ -170,15 +190,22 @@ npm install
 
    ```sh
    npm run dev
-   # equivalent to: celld dev
-   # Worker listener: http://127.0.0.1:9876
+   # starts the box executor on http://127.0.0.1:9877
+   # and celld dev on       http://127.0.0.1:9876
    ```
 
-   State persists in `.celld/dev/` across restarts. To start empty:
+   `scripts/dev.mjs` supervises both and forwards `SIGINT`: one Ctrl-C stops
+   both. To run the pieces separately, use `npm run box` in one shell and
+   `celld dev` in another. To start with empty state:
 
    ```sh
-   celld dev --clean
+   npm run dev -- --clean
+   # removes .celld/dev, .celld/workspaces, and .celld/box-id
    ```
+
+   `celld dev --clean` alone only wipes the transcript store; it leaves
+   workspaces and the box id. State persists in `.celld/dev/` and
+   `.celld/workspaces/` across restarts.
 
 4. **Health check**
 
@@ -198,6 +225,24 @@ npm install
 
    With a provider key set, the response contains `text` plus `submissionId`/`operationId`. If the model calls the `echo` tool, that proves the model → tool → transcript loop works.
 
+6. **Let it touch files**
+
+   t0 (the default) can read, write, edit, and clone; t1 also runs bash:
+
+   ```sh
+   curl -X POST localhost:9876/agent/test/config \
+     -H 'content-type: application/json' \
+     -d '{"sandbox":"t1"}'
+   # -> {"name":"test","sandbox":"t1","quotaMb":200}
+
+   curl -X POST localhost:9876/agent/test/prompt \
+     -H 'content-type: application/json' \
+     -d '{"prompt":"Write hello.ts that prints hello from the box, then run it with node and show the output."}'
+   ```
+
+   Files land in `.celld/workspaces/<id>/` on this box. The transcript stays in
+   SQLite. See [Working files](#working-files--the-box-executor).
+
 ---
 
 ## Configuration
@@ -214,6 +259,7 @@ npm install
 | `OPENCODE_MODEL` | No (defaults to catalog's first model) | Pins the opencode-go default model |
 | `OPENAI_API_KEY` | Yes, for OpenAI path (unless another provider is set) | Pi OpenAI provider (`gpt-5-mini` default) |
 | `GEMINI_API_KEY` | Yes, for Gemini path (unless another provider is set) | Pi Google provider (`gemini-2.5-flash` default) |
+| `FLEET_EXECUTOR_URL` | No (default `http://127.0.0.1:9877`) | Loopback URL of the box executor. Set the same value in the shell when running the daemon on another port. Loopback only. |
 | `CELLD_BUCKET` | No (local uses on-disk store) | S3-compatible bucket, e.g. `s3://my-fleet` — bucket/fleet deploys only |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | No | Bucket credentials — deploys only |
 | `AWS_REGION` | No | e.g. `auto` for R2 — deploys only |
@@ -354,10 +400,14 @@ Errors:
 
 ```sh
 curl localhost:9876/agent/alice/state
-# -> {"name":"alice","resident":true}
+# -> {"name":"alice","resident":true,"workspace":"<durable-object-id>-1"}
 ```
 
-Best-effort and deliberately coarse: if the route is reachable, the binding is addressable and celld activates the cell on demand. There is no per-cell residency probe yet.
+Best-effort and deliberately coarse: if the route is reachable, the binding is
+addressable and celld activates the cell on demand. It returns the deterministic
+workspace id; it never returns the token. Tier and quota are returned by
+`POST /config`. The workspace id is stable across a migration, but the files
+behind it are not; the prompt section carries the loss warning.
 
 ### `GET /agent/:name/messages`
 
@@ -370,14 +420,46 @@ curl 'localhost:9876/agent/test/messages?limit=10'
 
 `limit` defaults to 20, capped at 100. Each entry is `{id, kind, preview}` (preview truncated at 800 chars).
 
+### `POST /agent/:name/config`
+
+Set the workspace tier and/or quota for the **root** conversation. This is app
+config stored in DO SQLite next to pi's documents; it is not part of `pi.agent`.
+`t0` is files and git only, `t1` adds bash. The default quota is 200 MB.
+
+```sh
+curl -X POST localhost:9876/agent/test/config \
+  -H 'content-type: application/json' \
+  -d '{"sandbox":"t1"}'
+# -> {"name":"test","sandbox":"t1","quotaMb":200}
+
+curl -X POST localhost:9876/agent/test/config \
+  -H 'content-type: application/json' \
+  -d '{"quotaMb":50}'
+# -> {"name":"test","sandbox":"t1","quotaMb":50}
+```
+
+Either field may be omitted; omitted fields keep their stored value. Bad tiers,
+non-integer quotas, or a quota outside 1–4096 return `400`. Changing the tier
+does not create a workspace; the next tool call does. It also invalidates the
+in-memory token binding and, when a workspace already exists, rotates the token.
+
 ### `POST /agent/:name/reset`
 
-Start a new context for the agent. `GET /messages` returns a `pi.reset` entry, not the prior messages; the `/agents` entry (name, `lastActive`, `prompts`) is kept, and old rows may remain in storage. The next prompt re-applies the pin/heal logic, so it also picks up a moved default model.
+Start a new context for the agent and delete the local workspace. `GET /messages`
+returns a `pi.reset` entry, not the prior messages; the `/agents` entry (name,
+`lastActive`, `prompts`) is kept, and older transcript rows may remain in storage.
+The box daemon kills any running command for that workspace, then removes
+`.celld/workspaces/<id>/` and its `index.json` entry. The transcript reset is
+durable; the files are not. The next prompt starts a fresh workspace with the
+same tier/quota. Reset is idempotent: a second call has no workspace to delete.
 
 ```sh
 curl -X POST localhost:9876/agent/test/reset
-# -> {"name":"test","reset":true}
+# -> {"name":"test","reset":true,"workspaceDeleted":true}
 ```
+
+If the daemon is down, the transcript still resets and `workspaceDeleted` is
+`false`; the workspace record stays so a later reset can delete the files.
 
 ---
 
@@ -418,7 +500,8 @@ async ask(prompt, requestIdOrOptions) {
 
 ## Tools — the proof-of-loop
 
-The repo ships with one tool to prove the loop before anything real is added:
+The registry has two extensions: the `echo` proof-of-loop, and the coding
+bundle.
 
 ```ts
 const echoTool = defineTool({
@@ -432,7 +515,224 @@ const echoTool = defineTool({
 });
 ```
 
-Ask the model to echo something (`"use the echo tool to echo 'hello'"`). If the transcript shows the tool call and its output in the final text, your model → tool → transcript path works. `replay: "safe"` means the tool is side-effect-free and safe to re-run during resume/replay.
+| Tool | Replay | What it does |
+|---|---|---|
+| `echo` | safe | Echo text; proves the loop |
+| `read` | safe | Read a text or image file under `/workspace` |
+| `write` | unsafe | Create/overwrite a file |
+| `edit` | unsafe | Exact-text replacement, returns a diff |
+| `bash` | unsafe | Run a shell command in tier t1 (120 s cap) |
+| `git_clone` | unsafe | Clone an `https://` repo into `/workspace` (300 s cap) |
+| `git_status` | safe | `git status --porcelain=v1` for a workspace repo |
+
+`read` is the only coding tool marked safe: a crash may rerun it, and reading
+twice changes nothing. `write`, `edit`, `bash`, and `git_clone` are unsafe. pi
+commits their intent before running them, so after a crash it reports an
+`interrupted` result instead of rerunning them. That is deliberate: a rerun
+could append a second line, apply an edit twice, run a command twice, or leave
+a partial clone. The model may retry them in a later turn; it will see the
+interruption and the partial state.
+
+Ask the model to echo something (`"use the echo tool to echo 'hello'"`). If the
+transcript shows the tool call and its output in the final text, your model →
+tool → transcript path works.
+
+---
+
+## Working files — the box executor
+
+celld runs the Worker in a V8 isolate. It cannot write host files or spawn
+processes:
+
+```text
+node:fs.writeFileSync      -> node:fs.writeFileSync is not implemented in celld
+node:fs.readdirSync('/')   -> ENOENT: open '/'
+node:child_process.spawn   -> node:child_process.spawn is not implemented in celld
+process.cwd()              -> "/"
+process.env                -> {}
+```
+
+So `npm run dev` starts one more local process: a loopback box executor
+(`scripts/box.mjs`, `127.0.0.1:9877`). The Worker's `DaemonEnv`
+(`src/box-env.ts`) implements pi-durable's `ExecutionEnv` as authenticated
+HTTP calls. It is still one deployable Worker; the box is a single-box helper,
+not a container platform or a second storage system.
+
+```text
+celld Worker (V8)                          box daemon (Node, loopback)
+  Assistant DO                               .celld/workspaces/<id>/
+    DaemonEnv  ───────────────────────────►  /fs/*   resolve + prefix + lstat/realpath + O_NOFOLLOW
+      read / write / edit                    /git/*  git in the bwrap jail
+      bash / git_clone / git_status          /exec   bwrap + cleared env + timeout
+    transcript in DO SQLite                  token hash in index.json
+```
+
+The workspace id is `<durable-object-id>-<conversationId>`. Conversation ids
+are only unique inside one DO, so including the DO id keeps two agents from
+sharing a directory. The id is deterministic and visible in `GET /state`; the
+token is never returned there.
+
+### Code entry
+
+Two paths work:
+
+1. **Paste it into the prompt.** The model calls `write` (and `edit`) to create
+   files. This works in t0 and t1.
+2. **`git clone`.** Use the `git_clone` tool in t0 or t1 (or
+   `POST /git/clone` on the box). Bash is offline, so it cannot reach the
+   network; `git_clone` runs its fixed `https://` clone with network on. Local
+   paths, `file://`, `ext::`, plain `http://`, private addresses, and loopback
+   are rejected. `git_clone` is `--depth 1`, `GIT_ALLOW_PROTOCOL=https`,
+   `GIT_TERMINAL_PROMPT=0`, and has `--` before the URL.
+
+Both are documented in the [E2E proofs](docs/e2e-workspaces.md).
+
+### Environment allowlist
+
+A t1 command gets a cleared environment with exactly these values:
+
+```text
+PATH=/usr/bin:/bin
+HOME=/workspace
+LANG=C.UTF-8
+```
+
+bash adds `PWD`, `SHLVL`, and `_`; the probe output is in the
+[E2E proofs](docs/e2e-workspaces.md). There is no inherited environment:
+`FLEET_API_KEY`, `OVH_*`, `AWS_*`, `S3_*`, `CELLD_*`, `ROUTER_*`, and
+`.dev.vars` values are not present. `printenv | grep -Ei
+'FLEET|AWS|S3|CELLD|KEY|TOKEN'` prints nothing.
+
+### What runs a command
+
+t1 uses this exact `bwrap` shape:
+
+```sh
+bwrap --ro-bind /usr /usr \
+  --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib /lib64 \
+  --bind "$WORKSPACE" /workspace \
+  --tmpfs /tmp --proc /proc --dev /dev \
+  --unshare-all --die-with-parent --new-session --as-pid-1 \
+  --clearenv \
+  --setenv PATH /usr/bin:/bin --setenv HOME /workspace --setenv LANG C.UTF-8 \
+  --chdir /workspace \
+  -- /usr/bin/bash -lc "$COMMAND"
+```
+
+Only an `/exec` call with `net:true` adds `--share-net` and read-only binds for
+`resolv.conf`, `hosts`, `nsswitch.conf`, `ssl`, and `ca-certificates`; otherwise
+the network namespace is unshared. The `bash` tool never sets `net`, so agent
+bash is offline; `git_clone` uses the separate `/git/clone` route with network
+on for its validated public URL. The
+`--as-pid-1` keeps bwrap's own argv (including the host workspace path) out of
+`/proc/1/cmdline`; `/proc/1/environ` shows only the cleared env. `/etc/shadow`,
+`/home`, `~/.ssh`, and host absolute paths do not exist inside. `sudo` fails
+because bwrap sets no-new-privileges.
+
+### Limits
+
+- **Command timeout:** 120 s default/hard cap (`FLEET_EXEC_TIMEOUT_MS`).
+- **Clone timeout:** 300 s default (`FLEET_CLONE_TIMEOUT_MS`).
+- **Output:** 10 MB retained (byte-counted); larger output is truncated and,
+  past the bash tool's spill threshold, spilling is reported.
+- **File size:** 11 MiB (leaves headroom for base64 inflation inside the 16 MB
+  JSON body); reads of larger files are rejected.
+- **Quota:** 200 MB per workspace by default, checked on write and clone;
+  `POST /agent/:name/config {"quotaMb":50}` lowers it; `/config` returns the
+  stored value. A write or clone that would cross it returns `quota_exceeded`.
+- **Path jail:** every `/fs/*` path is mapped to the workspace with
+  `path.resolve(workspace, target)`, rejected unless it is the workspace or
+  starts with `workspace + path.sep`, checked component by component with
+  `lstat`/`realpath`, and opened with `O_NOFOLLOW` after `realpath(dirname)`.
+
+---
+
+## Tiers, quotas, and config
+
+| Tier | read/write/edit | `git_clone` / `git_status` | `bash` |
+|---|---|---|---|
+| `t0` (default) | yes | yes | `shell_unavailable` |
+| `t1` | yes | yes | yes, under bwrap |
+
+Tier and quota are app config stored in DO SQLite under
+`fleet:sandboxTier:v1:<conversationId>` and
+`fleet:sandboxQuota:v1:<conversationId>`, next to pi's documents. `pi.agent`
+has no extension point for application fields, so this is deliberately a
+separate key, not a fake `pi.agent` field. Set it with `POST /config`:
+
+```sh
+curl -X POST localhost:9876/agent/test/config -d '{"sandbox":"t1"}'
+curl -X POST localhost:9876/agent/test/config -d '{"quotaMb":50}'
+```
+
+A t0 agent that calls `bash` gets a `shell_unavailable` tool error and keeps
+going; it does not hang. Changing the tier takes effect on the next env build
+(the next tool call or request), not retroactively inside a running call.
+
+---
+
+## Security and the jail
+
+The box is a local trust boundary, not a multi-tenant hard boundary.
+
+- **Loopback only, token per workspace.** The daemon binds `127.0.0.1`; every
+  route except `GET /health` and the enrollment `POST /workspace` needs
+  `Authorization: Bearer <token>` and `X-Fleet-Workspace: <id>`. The daemon
+  stores SHA-256 hashes in `.celld/workspaces/index.json`, not plaintext. The
+  Worker stores the plaintext in DO SQLite and re-handshakes once on a 401.
+- **No CORS.** The daemon never emits `Access-Control-Allow-*`; a browser page
+  cannot call it with a cross-origin `fetch` and a JSON content type.
+- **Path and symlink checks** as described above. A symlink inside the
+  workspace is allowed only if its real target stays inside; an escaping link
+  is rejected before a missing file below it is created.
+- **Command separation.** t1 commands see only `/usr`, `/bin`, `/lib`,
+  `/lib64`, the workspace, `/tmp`, `/proc`, and `/dev`. They run with a
+  cleared env, no-new-privileges, and no host `/home`. Network commands bind
+  only `/etc/resolv.conf`, `/etc/hosts`, `/etc/nsswitch.conf`, `/etc/ssl`, and
+  `/etc/ca-certificates`; no other host `/etc` path exists.
+- **Git gates.** Only `https://`; no credentials in the URL; private, loopback,
+  link-local, and `.local` hosts are rejected; DNS is resolved and checked for
+  private addresses; `GIT_ALLOW_PROTOCOL=https` blocks `file://`/`ext::`;
+  `--` precedes the URL. Git re-resolves at connect time, so a deliberate
+  rebinding race is outside this local trust boundary.
+- **Reset kills first.** `POST /reset` asks the daemon to kill running commands
+  for that workspace, then deletes the directory and token entry. The
+  transcript reset is separate and durable.
+
+Limits worth stating plainly:
+
+- The Worker itself has no auth (see Tradeoffs). Keep it on loopback. A local
+  process that can reach the box can call `POST /workspace` and rotate a token;
+  this is the same local trust level as the unauthenticated Worker.
+- bwrap is a sandbox, not a VM. A kernel/bwrap escape gets the daemon's user
+  (usually you). The path checks are TOCTOU-hardened with `realpath(dirname)`
+  plus `O_NOFOLLOW`, not a proof against a hostile local process racing the
+  daemon.
+- The sandbox can read `/proc` for its own namespace, including the command it
+  was asked to run. It cannot read host `/proc` (PID namespace is unshared).
+- Files are not encrypted and not snapshotted. Reset and migration delete (or
+  park) them.
+
+---
+
+## Durable vs scratch
+
+| Thing | Where | Survives a process crash? | Survives moving to another box? |
+|---|---|---|---|
+| Transcript, tool results, model pin | DO SQLite (`.celld/dev/`) | yes | yes — SQLite moves with the DO |
+| Workspace files | `.celld/workspaces/<id>/` on the box | yes, if the directory is on disk | **no** until PR2 |
+
+Each workspace has a `.fleet-workspace` marker with `{id, boxId, createdAt}`.
+If the daemon starts with a different `boxId` (a different box, or a deliberate
+E2E restart), it parks the old directory as `<id>.lost-<timestamp>` and starts
+an empty one. The Worker stores the previous `boxId`, and the prompt's
+`<workspace>` section tells the model: the previous workspace was on box X and
+is gone; do not claim a file exists without a read/stat/list. The E2E transcript
+shows the agent saying exactly that.
+
+PR2 will snapshot the directory (and/or archive it to bucket storage) and leave
+a pointer in the workspace record. PR1 deliberately does not sync, upload, or
+archive anything.
 
 ---
 
@@ -441,18 +741,27 @@ Ask the model to echo something (`"use the echo tool to echo 'hello'"`). If the 
 ```
 fleet-base/
 ├── src/
-│   └── index.ts          # Worker routes + Assistant/Registry DOs + echo tool + model wiring
-├── wrangler.jsonc        # Worker name, entry, DO bindings, SQLite migrations
-├── package.json          # npm scripts (dev → celld dev), pi/ai/durable + agents deps
-├── .env.example          # Copy to .dev.vars; one provider key required
+│   ├── index.ts              # Worker routes + Assistant/Registry DOs + tools + model wiring
+│   └── box-env.ts            # pi-durable ExecutionEnv over the loopback box
+├── scripts/
+│   ├── box.mjs               # loopback workspace executor (fs/git/exec)
+│   ├── dev.mjs               # starts box + celld, forwards SIGINT
+│   └── deploy.mjs            # bucket deploy with vars injection
+├── wrangler.jsonc            # Worker name, entry, DO bindings, SQLite migrations
+├── package.json              # npm scripts (dev → dev.mjs, box → box.mjs)
+├── .env.example              # Copy to .dev.vars; one provider key + executor URL
+├── docs/
+│   ├── specs/workspaces-pr1.md
+│   └── e2e-workspaces.md     # pasted E2E transcripts
 ├── deploy/
-│   ├── fleet.service     # systemd unit for a fleet node (bucket deploys)
-│   └── celld.env         # Non-default celld tuning (leases, polling, GC, caps)
-├── .celld/               # Local celld state (git-ignored, created by celld dev)
+│   ├── fleet.service         # systemd unit for a fleet node (bucket deploys)
+│   └── celld.env             # Non-default celld tuning (leases, polling, GC, caps)
+├── .celld/
+│   ├── dev/                  # local celld state (git-ignored)
+│   ├── workspaces/           # box files + index.json (git-ignored)
+│   └── box-id                # stable box identity for loss detection
 └── README.md / LICENSE
 ```
-
----
 
 ## Adding your own tool
 
@@ -470,17 +779,21 @@ fleet-base/
    });
    ```
 
-2. Register it:
+2. Register it in the extension that fits:
 
    ```ts
    this.registry.install({ name: "fleet-base", tools: [echoTool, upperTool] });
+   // or add it to codingExtension's tools list
    ```
 
-3. Restart `celld dev` and prompt: `"use the upper tool on 'hello'"`.
+3. Restart `npm run dev` and prompt: `"use the upper tool on 'hello'"`.
 
 Tips:
 
-- `replay: "safe"` tools re-run freely on resume. Side-effecting tools (send email, write DB) need replay discipline — check `pi-durable` docs for `replay` semantics before marking them safe.
+- `replay: "safe"` tools re-run freely on resume. Side-effecting tools (send email, write DB, write a file, run a command) are `replay: "unsafe"`: after a crash pi reports `interrupted` instead of rerunning them. Check `pi-durable` docs for `replay` semantics before marking anything safe.
+- A tool that needs the box can use `api.env`; it is a
+  [`DaemonEnv`](src/box-env.ts) in this repo and exposes
+  `request(route, body)` for the authenticated daemon routes.
 - Keep tool `name` + `description` precise — that's what the model sees when deciding to call it.
 - Validate `parameters` with `Type.*` (from `@earendil-works/pi-ai`) so bad model args fail early.
 
@@ -490,7 +803,8 @@ Tips:
 
 - **More agents:** no code change — `POST /agent/<any-name>/prompt` creates/address a DO by name. Use one name per user, per repo, per employee, etc. Each name shows up in `GET /agents` after its first prompt.
 - **More bindings:** add to `wrangler.jsonc` (R2, KV, D1, queues, workflows) and extend `Env` in `src/index.ts`. Keep `wrangler.jsonc` minimal until you need them — each binding is a new failure mode.
-- **Multi-harness / MCP / containers:** intentionally absent. Add them after the echo loop + resume tests pass on your machine.
+- **Workspaces:** every agent gets a per-conversation directory. The id is derived from the DO id, so adding agents needs no box config. `POST /config` sets tier/quota per agent.
+- **Multi-harness / MCP / containers:** intentionally absent. Add them after the echo loop, file tools, and resume tests pass on your machine.
 
 ---
 
@@ -525,6 +839,14 @@ CELLD_READY_FLEET_GATE_MS=0 celld \
 - [deploy/fleet.service](deploy/fleet.service) — systemd unit. After deploying a new bundle, `POST /reload` on the internal listener (`127.0.0.1:8081` by default) to adopt it immediately instead of waiting `CELLD_DEPLOY_POLL_S`.
 - Never expose the internal listener to the public internet — keep peer traffic on a trusted network / encrypted overlay (see comments in `fleet.service`).
 
+**Working files on a bucket node (PR1):** the box daemon is a local process,
+not an object in the bucket. Run `npm run box` (or `node scripts/box.mjs`) on
+each node that should have workspaces, with `FLEET_EXECUTOR_URL` pointing at its
+loopback address. The bucket moves the transcript with the DO; it does **not**
+move `.celld/workspaces`. A DO that lands on another node reports the old box
+and an empty workspace. Automated snapshot/pointer and multi-node placement are
+PR2; do not describe this tag as giving you portable files.
+
 ---
 
 ## Troubleshooting
@@ -538,7 +860,14 @@ CELLD_READY_FLEET_GATE_MS=0 celld \
 | `celld: command not found` | Install celld, ensure it's on `PATH` |
 | `esbuild: command not found` / bundle error | Install esbuild or set `CELLD_ESBUILD=/path/to/esbuild` |
 | Port `9876` in use | Stop the other `celld dev`, or check what's listening |
-| Stale/corrupt local state | `celld dev --clean` (wipes `.celld/dev/`) |
+| Stale/corrupt local state | `npm run dev -- --clean` (wipes `.celld/dev/`, `.celld/workspaces/`, `.celld/box-id`) |
+| `box executor is unreachable at http://127.0.0.1:9877` | Start both with `npm run dev`, or run `npm run box` beside `celld dev`. Check `curl localhost:9877/health`. |
+| `shell_unavailable: exec requires tier t1` | The agent is t0. `POST /agent/:name/config {"sandbox":"t1"}` and retry. |
+| `bwrap is not installed` / t1 fails, t0 works | Install `bubblewrap` at `/usr/bin/bwrap`; t0 file/git tools do not need it. |
+| `bad_url: private, loopback...` or `https:// only` | `git_clone` accepts public `https://` only. Use a public repo; local paths and `file://` are rejected. |
+| `token_conflict` or repeated 401s | Reset the agent (`POST /reset`) to clear the old workspace/token, then retry. |
+| `quota_exceeded` | Raise `quotaMb` with `POST /config` or reset the workspace. Default is 200 MB. |
+| Port `9877` in use | Stop the other box (`npm run box`/`npm run dev`) or set `FLEET_EXECUTOR_URL` in both `.dev.vars` and the shell. |
 | Second POST with same `requestId` starts a new run | You changed `prompt` or agent `:name` — idempotency is per `(agent, operationId)`; also check you're sending `requestId`/`operationId` as a string |
 | `wrangler` deploy errors about bindings | Keep `wrangler.jsonc` minimal; add one binding at a time |
 
@@ -546,9 +875,14 @@ CELLD_READY_FLEET_GATE_MS=0 celld \
 
 ## Roadmap — not implemented yet
 
-- containers / Docker / `containers[]` / `ctx.container`
+- **PR2: workspace snapshot/archive + pointer**, so a migrated agent can recover
+  its files instead of reporting them gone. No sync/upload in this tag.
+- **t2: `ctx.container`** behind the same box protocol. Containers are still
+  absent here; bwrap is not a container runtime.
 - MCP servers
 - skills
+- subagents
+- web tools / background command tools
 - multi-harness
 - UI (no Next.js/Vite/React)
 - auth
@@ -563,7 +897,7 @@ If you build one of these on top of this base, a PR describing your approach is 
 
 ## Contributing
 
-Issues and PRs welcome. Keep the base minimal — prove the tool loop + resume first, then layer features. Run `celld dev --clean` + the [First prompt](#quickstart) and [Idempotency](#idempotency-and-crash-resume) checks before opening a PR.
+Issues and PRs welcome. Keep the base minimal — prove the tool loop + resume first, then layer features. Run `npm run dev -- --clean` + the [First prompt](#quickstart), [Working files](#working-files--the-box-executor), and [Idempotency](#idempotency-and-crash-resume) checks before opening a PR. The PR1 transcripts are in [docs/e2e-workspaces.md](docs/e2e-workspaces.md).
 
 ---
 
