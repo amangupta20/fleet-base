@@ -53,9 +53,13 @@ otherwise share a directory. The id is deterministic and exposed in
    `box_mismatch` from the daemon and the same one-retry path.
 2. **Routes.**
    - `POST /workspace` — enroll/rotate, no auth (loopback admin surface).
-   - `FLEET_BOX_ROOT`, `FLEET_BOX_ID_FILE`, and `FLEET_BOX_ID` are test-only
-     overrides for redirecting or pinning a workspace in E2E; production uses
-     `.celld/workspaces` and `.celld/box-id`.
+   - `FLEET_BOX_ROOT`, `FLEET_BOX_ID_FILE`, `FLEET_BOX_ID`, `FLEET_BOX_TEST`,
+     and `FLEET_BOX_TEST_WRITE_PAUSE_MS` are test-only overrides for E2E;
+     production uses `.celld/workspaces` and `.celld/box-id`. `FLEET_BOX_ID`
+     is honored only when `FLEET_BOX_TEST=1` or `NODE_ENV=test`; otherwise the
+     daemon logs a warning and uses `.celld/box-id`. The pause hook runs after
+     `mkdirSync()` for the symlink-swap probe and has no effect outside test
+     mode.
    - `POST /workspace/reset` — auth.
    - `POST /fs/read {path, binary?, offset?, length?}`, `/fs/write`,
      `/fs/stat`, `/fs/canonical`.

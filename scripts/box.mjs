@@ -124,9 +124,19 @@ function fail(status, code, message) {
   throw new BoxError(status, code, message);
 }
 
+function isTestMode() {
+  return process.env.FLEET_BOX_TEST === "1" || process.env.NODE_ENV === "test";
+}
+
 function loadBoxId() {
   const override = process.env.FLEET_BOX_ID?.trim();
-  if (override) return override;
+  if (override) {
+    if (isTestMode()) return override;
+    console.warn(
+      "[box] WARNING: FLEET_BOX_ID is ignored outside test mode " +
+        "(set FLEET_BOX_TEST=1 or NODE_ENV=test); using .celld/box-id.",
+    );
+  }
   try {
     const stored = readFileSync(BOX_ID_FILE, "utf8").trim();
     if (stored) return stored;
@@ -395,6 +405,61 @@ function virtualFor(root, target) {
   return rel ? posix.join(VIRTUAL_ROOT, rel.split(sep).join("/")) : VIRTUAL_ROOT;
 }
 
+function assertNoEscapingLinks(root, target, label) {
+  // lstat every existing component: a link that leaves the workspace is
+  // rejected even before a missing file below it is created.
+  const parts = relative(root, target).split(sep).filter(Boolean);
+  let current = root;
+  for (const part of parts) {
+    current = join(current, part);
+    let info;
+    try {
+      info = lstatSync(current);
+    } catch (error) {
+      if (error?.code === "ENOENT") break;
+      throw error;
+    }
+    if (info.isSymbolicLink()) {
+      let real;
+      try {
+        real = realpathSync(current);
+      } catch {
+        fail(400, "path_escape", `broken symlink ${JSON.stringify(label)}`);
+      }
+      assertInside(root, real, "symlink");
+    }
+  }
+}
+
+function revalidateDirectory(root, dir) {
+  assertInside(root, dir, "parent");
+  assertNoEscapingLinks(root, dir, "parent");
+  let real;
+  try {
+    real = realpathSync(dir);
+  } catch {
+    fail(404, "not_found", "parent directory does not exist");
+  }
+  assertInside(root, real, "parent");
+  return real;
+}
+
+function revalidateExisting(root, target) {
+  assertInside(root, target, "path");
+  if (target === root) return root;
+  assertNoEscapingLinks(root, target, "path");
+  let parent;
+  try {
+    parent = realpathSync(dirname(target));
+  } catch {
+    fail(404, "not_found", "parent directory does not exist");
+  }
+  assertInside(root, parent, "parent");
+  const final = join(parent, basename(target));
+  assertInside(root, final, "path");
+  return final;
+}
+
 function resolveInWorkspace(root, input) {
   if (typeof input !== "string" || input.length === 0) {
     fail(400, "bad_path", "path must be a non-empty string");
@@ -415,29 +480,7 @@ function resolveInWorkspace(root, input) {
   const lexical = resolve(root, requested);
   assertInside(root, lexical, "path");
 
-  // lstat every existing component: a link that leaves the workspace is
-  // rejected even before a missing file below it is created.
-  const parts = relative(root, lexical).split(sep).filter(Boolean);
-  let current = root;
-  for (const part of parts) {
-    current = join(current, part);
-    let info;
-    try {
-      info = lstatSync(current);
-    } catch (error) {
-      if (error?.code === "ENOENT") break;
-      throw error;
-    }
-    if (info.isSymbolicLink()) {
-      let real;
-      try {
-        real = realpathSync(current);
-      } catch {
-        fail(400, "path_escape", `broken symlink ${JSON.stringify(input)}`);
-      }
-      assertInside(root, real, "symlink");
-    }
-  }
+  assertNoEscapingLinks(root, lexical, input);
 
   let probe = lexical;
   const suffix = [];
@@ -485,11 +528,30 @@ function readBytes(root, target) {
   }
 }
 
+function pauseForSwapProbe() {
+  if (!isTestMode()) return;
+  const ms = Number(process.env.FLEET_BOX_TEST_WRITE_PAUSE_MS);
+  if (!Number.isInteger(ms) || ms <= 0) return;
+  // Block this process after mkdir so an external E2E probe can replace the
+  // new directory with a symlink. No effect outside test mode.
+  Atomics.wait(
+    new Int32Array(new SharedArrayBuffer(4)),
+    0,
+    0,
+    Math.min(ms, 30_000),
+  );
+}
+
 function writeBytes(root, target, bytes) {
   if (basename(target) === MARKER) {
     fail(400, "reserved_path", `${MARKER} is managed by the box`);
   }
   mkdirSync(dirname(target), { recursive: true });
+  pauseForSwapProbe();
+  // mkdirSync() may have created directories through a link that was live
+  // then; re-walk the parent after it returns, then let openNoFollow() do its
+  // own realpath(dirname) check again.
+  revalidateDirectory(root, dirname(target));
   let opened;
   try {
     opened = openNoFollow(
@@ -577,10 +639,11 @@ function fsWrite(id, entry) {
     }
     let existing = 0;
     try {
-      const info = statSync(target);
+      const info = statSync(revalidateExisting(dir, target));
       if (info.isFile()) existing = info.size;
-    } catch {
-      // New file.
+    } catch (error) {
+      if (error instanceof BoxError && error.code !== "not_found") throw error;
+      // New file or new parent directory.
     }
     checkQuota(dir, entry, Math.max(0, bytes.length - existing));
     const written = writeBytes(dir, target, bytes);
@@ -592,15 +655,16 @@ function fsStat(id) {
   const dir = workspaceDir(id);
   return (body) => {
     const target = resolveInWorkspace(dir, body.path);
+    const checked = revalidateExisting(dir, target);
     let info;
     try {
-      info = statSync(target);
+      info = statSync(checked);
     } catch {
       fail(404, "not_found", `path ${JSON.stringify(body.path)} does not exist`);
     }
     return {
-      name: basename(target),
-      path: virtualFor(dir, target),
+      name: basename(checked),
+      path: virtualFor(dir, checked),
       kind: info.isDirectory() ? "directory" : "file",
       size: info.size,
       mtimeMs: info.mtimeMs,

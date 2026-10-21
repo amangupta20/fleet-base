@@ -286,6 +286,31 @@ net=true   exit 0  net_used true   stdout "200"
 `git_clone` uses the separate `/git/clone` route with network on for its
 validated public URL. Agent bash cannot exfiltrate through curl/wget by default.
 
+## 6c. Parent-swap after `mkdirSync()` is rejected
+
+`writeBytes()` now re-walks the parent with `lstat`/`realpath` after
+`mkdirSync()` and before `openNoFollow()`. The probe starts a write, waits for
+`mkdir` to create `swap-dir`, renames it, symlinks it to `/tmp/fleet-swap-outside`,
+then lets the daemon resume. The test-only pause makes the race deterministic;
+`fsStat` also revalidates before its `statSync`.
+
+```sh
+FLEET_BOX_TEST=1 FLEET_BOX_TEST_WRITE_PAUSE_MS=1500 \
+FLEET_BOX_ID=box-swap-probe FLEET_EXECUTOR_URL=http://127.0.0.1:9898 \
+FLEET_BOX_ROOT=... node scripts/box.mjs
+```
+
+```text
+issue 200 {'id': 'swap-probe', 'token': '<redacted>', 'boxId': 'box-swap-probe', 'tier': 't1', 'quotaMb': 200, 'created': True}
+swap seen: True
+write: (400, {'error': {'code': 'path_escape', 'message': 'symlink escapes the workspace'}})
+outside file exists: False
+stat: (400, {'error': {'code': 'path_escape', 'message': 'symlink escapes the workspace'}})
+```
+
+The write target and the `fsStat` target both resolve through a parent that was
+swapped after mkdir; neither request reaches the outside directory.
+
 ## 7. Reset kills execs and deletes the workspace
 
 Direct daemon test: start `sleep 60`, call `/workspace/reset` with the token.
@@ -362,7 +387,36 @@ restart-test.lost-...
 ```
 
 The token hash and files survive `kill -9` + restart with the same box id. A
-new box id parks the directory and reports `lostFrom`.
+new box id parks the directory and reports `lostFrom`. These restarts set
+`FLEET_BOX_TEST=1`; outside test mode a `FLEET_BOX_ID` override is ignored (see
+§9b).
+
+## 9b. `FLEET_BOX_ID` is ignored outside test mode
+
+The same daemon, first without test mode and with `FLEET_BOX_ID=box-prod-override`:
+
+```text
+$ curl -s localhost:9899/health
+{"ok":true,"boxId":"box-1cdbf66a-22b6-4944-980d-dc4723c6a741","bwrap":true,"version":1}
+
+$ cat box.log
+[box] WARNING: FLEET_BOX_ID is ignored outside test mode (set FLEET_BOX_TEST=1 or NODE_ENV=test); using .celld/box-id.
+[box] listening on http://127.0.0.1:9899 (box box-1cdbf66a-22b6-4944-980d-dc4723c6a741, ...)
+
+$ cat box-id
+box-1cdbf66a-22b6-4944-980d-dc4723c6a741
+```
+
+With `FLEET_BOX_TEST=1` the override is honored:
+
+```text
+$ FLEET_BOX_TEST=1 FLEET_BOX_ID=box-test-override ... node scripts/box.mjs
+$ curl -s localhost:9900/health
+{"ok":true,"boxId":"box-test-override","bwrap":true,"version":1}
+```
+
+`NODE_ENV=test` is the alternative gate. Production ignores a stray
+`FLEET_BOX_ID` and uses the durable `.celld/box-id` file.
 
 ## 10. Git escape gates
 
@@ -400,6 +454,10 @@ workspace root, box id, and daemon URL are environment-driven:
 npm run dev -- --port 9886 --no-watch
 npm run dev -- --clean           # wipe .celld/dev, .celld/workspaces, .celld/box-id
 FLEET_EXECUTOR_URL=http://127.0.0.1:9877 npm run box
+
+# Test-only box id / parent-swap probes:
+FLEET_BOX_TEST=1 FLEET_BOX_TEST_WRITE_PAUSE_MS=1500 \
+FLEET_BOX_ID=box-test-1 FLEET_EXECUTOR_URL=http://127.0.0.1:9898 npm run box
 ```
 
 
